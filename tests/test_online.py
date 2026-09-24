@@ -18,6 +18,85 @@ MENU = """选择: 1
 
 
 class OnlineTests(unittest.TestCase):
+    def test_bad_upstream_skips_one_node_and_scans_remaining_nodes(self):
+        menu = [(1, "a"), (2, "b"), (3, "c")]
+        nodes = [core.Node(name, "192.0.2.1", 5000 + number, "user", "secret")
+                 for number, name in menu]
+
+        def probe(host, port, username, password):
+            if port == 5002:
+                raise online.OnlineError("SOCKS 上游出口 IP 验证失败")
+            return "192.0.2.10"
+
+        with patch.object(online, "scan_one", side_effect=nodes) as scan, \
+             patch.object(online, "probe_socks", side_effect=probe), \
+             patch.object(online, "stop_vendor"), \
+             patch.object(online, "restore_route"), \
+             patch.object(online, "restore_policy_rules"), \
+             patch.object(online, "_guard_update"), \
+             patch.object(online, "_status"):
+            records, ips, statuses, skipped = online._collect_nodes(
+                menu, None, Path("/tmp"), "default via 192.0.2.1 dev eth0",
+                {"-4": [], "-6": []})
+        self.assertEqual(scan.call_count, 3)
+        self.assertEqual([node.name for node in records], ["a", "c"])
+        self.assertEqual(set(ips), {"a", "c"})
+        self.assertEqual(statuses, {"a": "OK", "b": "SKIPPED", "c": "OK"})
+        self.assertEqual(skipped, ["b"])
+
+    def test_failed_new_credentials_keep_working_old_endpoint(self):
+        prior = core.reconcile_nodes([core.Node("a", "192.0.2.1", 5001, "old", "old-pass")],
+                                     master=core.generate_master())
+        fresh = core.Node("a", "192.0.2.2", 5002, "new", "new-pass")
+
+        def probe(host, port, username, password):
+            if port == 5002:
+                raise online.OnlineError("SOCKS 上游出口 IP 验证失败")
+            return "192.0.2.10"
+
+        with patch.object(online, "scan_one", return_value=fresh), \
+             patch.object(online, "probe_socks", side_effect=probe), \
+             patch.object(online, "stop_vendor"), \
+             patch.object(online, "restore_route"), \
+             patch.object(online, "restore_policy_rules"), \
+             patch.object(online, "_guard_update"), \
+             patch.object(online, "_status"):
+            records, ips, statuses, skipped = online._collect_nodes(
+                [(1, "a")], prior, Path("/tmp"), "default via 192.0.2.1 dev eth0",
+                {"-4": [], "-6": []})
+        self.assertEqual(records[0].server_port, 5001)
+        self.assertEqual(records[0].username, "old")
+        self.assertEqual(ips, {"a": "192.0.2.10"})
+        self.assertEqual(statuses, {"a": "STALE"})
+        self.assertEqual(skipped, [])
+
+    def test_changed_menu_aborts_even_when_other_nodes_could_work(self):
+        with patch.object(online, "scan_one", side_effect=online.MenuChangedError("changed")), \
+             patch.object(online, "stop_vendor") as stop, \
+             patch.object(online, "restore_route"), \
+             patch.object(online, "restore_policy_rules"), \
+             patch.object(online, "_guard_update"), \
+             patch.object(online, "_status"):
+            with self.assertRaises(online.MenuChangedError):
+                online._collect_nodes([(1, "a")], None, Path("/tmp"),
+                                      "default via 192.0.2.1 dev eth0",
+                                      {"-4": [], "-6": []})
+        stop.assert_called_once()
+
+    def test_all_failed_nodes_do_not_produce_empty_deployment(self):
+        with patch.object(online, "scan_one", return_value=core.Node(
+                "a", "192.0.2.1", 5001, "user", "secret")), \
+             patch.object(online, "probe_socks", side_effect=online.OnlineError("unavailable")), \
+             patch.object(online, "stop_vendor"), \
+             patch.object(online, "restore_route"), \
+             patch.object(online, "restore_policy_rules"), \
+             patch.object(online, "_guard_update"), \
+             patch.object(online, "_status"):
+            with self.assertRaisesRegex(online.OnlineError, "没有任何可验证"):
+                online._collect_nodes([(1, "a")], None, Path("/tmp"),
+                                      "default via 192.0.2.1 dev eth0",
+                                      {"-4": [], "-6": []})
+
     def test_complete_menu_and_ansi_codes(self):
         marked = MENU.replace("[2]", "\x1b[32m[2]\x1b[0m")
         self.assertEqual(online.parse_menu(marked),

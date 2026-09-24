@@ -61,6 +61,10 @@ class OnlineError(Exception):
     """Safe error text which must never contain a captured credential."""
 
 
+class MenuChangedError(OnlineError):
+    """The baseline node list is no longer trustworthy during this scan."""
+
+
 def parse_menu(text: str) -> list[tuple[int, str]]:
     """Accept a complete menu only after its node-ID prompt was captured."""
     clean = ANSI.sub("", text).replace("\r", "")
@@ -208,7 +212,7 @@ def scan_one(number: int, name: str, expected_menu: list[tuple[int, str]], work:
     try:
         menu = parse_menu(_menu_to_node_prompt(fd))
         if menu != expected_menu:
-            raise OnlineError("扫描期间 LazyCat 节点菜单发生变化")
+            raise MenuChangedError("扫描期间 LazyCat 节点菜单发生变化")
         os.write(fd, f"{number}\n".encode("ascii"))
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
@@ -309,6 +313,7 @@ def probe_socks(host: str, port: int, username: str | None, password: str | None
     """SOCKS5 CONNECT + HTTPS IP check; credentials never appear in argv/logs."""
     if (username is None) != (password is None):
         raise OnlineError("SOCKS 用户名与密码必须同时提供")
+    failures: list[str] = []
     for destination in ("api.ipify.org", "icanhazip.com"):
         try:
             with socket.create_connection((host, port), timeout=8) as sock:
@@ -353,9 +358,13 @@ def probe_socks(host: str, port: int, username: str | None, password: str | None
                         raise OnlineError("出口检测网站的分块响应不完整")
                     body = payload[:int(length.split(b";", 1)[0], 16)]
                 return str(ipaddress.IPv4Address(body.decode("ascii").strip()))
-        except (OSError, UnicodeError, ValueError, OnlineError):
+        except OnlineError as exc:
+            failures.append(f"{destination}: {exc}")
             continue
-    raise OnlineError("SOCKS 上游出口 IP 验证失败")
+        except (OSError, UnicodeError, ValueError) as exc:
+            failures.append(f"{destination}: {type(exc).__name__}")
+            continue
+    raise OnlineError("SOCKS 上游出口 IP 验证失败 (" + "; ".join(failures) + ")")
 
 
 def _free_port() -> int:
@@ -462,7 +471,8 @@ def _load_previous() -> tuple[str, dict[str, Any] | None]:
 
 
 def _stage(state: dict[str, Any], master: str, binary: str,
-           menu: list[tuple[int, str]], ips: dict[str, str]) -> Path:
+           menu: list[tuple[int, str]], ips: dict[str, str],
+           node_status: dict[str, str]) -> Path:
     GENERATIONS.mkdir(mode=0o700, parents=True, exist_ok=True)
     generation = Path(tempfile.mkdtemp(prefix="generation-", dir=GENERATIONS))
     try:
@@ -471,7 +481,8 @@ def _stage(state: dict[str, Any], master: str, binary: str,
         core.save_private_config(generation / "config.json",
                                  core.build_config(state, listen="0.0.0.0", listen_port=PORT))
         core.save_private_json(generation / "meta.json", {
-            "nodes": [{"id": number, "name": name, "exit_ip": ips[name]}
+            "nodes": [{"id": number, "name": name, "exit_ip": ips.get(name, ""),
+                       "status": node_status[name]}
                       for number, name in menu],
         })
         check = subprocess.run([binary, "check", "-c", str(generation / "config.json")],
@@ -533,6 +544,76 @@ def _status(value: str, message: str, **fields: Any) -> None:
     _write_json(STATUS, {"state": value, "message": message, "time": time.time(), **fields})
 
 
+def _collect_nodes(menu: list[tuple[int, str]], previous: dict[str, Any] | None,
+                   work: Path, baseline: str,
+                   baseline_rules: dict[str, list[str]]) -> tuple[list[core.Node], dict[str, str],
+                                                                  dict[str, str], list[str]]:
+    """Continue after one bad upstream, retaining a still-working old endpoint."""
+    records: list[core.Node] = []
+    ips: dict[str, str] = {}
+    node_status: dict[str, str] = {}
+    skipped: list[str] = []
+    old_nodes = previous["nodes"] if previous is not None else {}
+    for position, (number, name) in enumerate(menu, 1):
+        _status("running", f"正在扫描 {position}/{len(menu)}: {name}")
+        _guard_update(scanning_started=True)
+        record: core.Node | None = None
+        failure: OnlineError | None = None
+        try:
+            try:
+                record = scan_one(number, name, menu, work)
+            except MenuChangedError:
+                raise
+            except OnlineError as exc:
+                failure = exc
+        finally:
+            try:
+                stop_vendor()
+            finally:
+                restore_route(baseline)
+                restore_policy_rules(baseline_rules)
+                _guard_update(scanning_started=False)
+
+        if record is not None:
+            try:
+                exit_ip = probe_socks(record.server, record.server_port,
+                                      record.username, record.password)
+            except OnlineError as exc:
+                failure = exc
+            else:
+                print(f"[上游] {name}: {exit_ip}", flush=True)
+                records.append(record)
+                ips[name] = exit_ip
+                node_status[name] = "OK"
+                _guard_update()
+                continue
+
+        if name in old_nodes:
+            old = old_nodes[name]
+            try:
+                old_ip = probe_socks(old["server"], old["server_port"],
+                                     old["username"], old["password"])
+            except OnlineError:
+                pass
+            else:
+                records.append(core.Node(name, old["server"], old["server_port"],
+                                         old["username"], old["password"]))
+                ips[name] = old_ip
+                node_status[name] = "STALE"
+                print(f"[保留旧配置] {name}: {old_ip}", flush=True)
+                _guard_update()
+                continue
+
+        node_status[name] = "SKIPPED"
+        skipped.append(name)
+        print(f"[跳过] {name}: {failure or '当前 SOCKS 上游不可用'}", flush=True)
+        _guard_update()
+
+    if not records:
+        raise OnlineError("当前菜单没有任何可验证的出口；保留已有配置")
+    return records, ips, node_status, skipped
+
+
 def _worker(operation: str) -> int:
     RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
     if fcntl is None:
@@ -578,36 +659,22 @@ def _worker(operation: str) -> int:
                 _status("running", "正在读取 LazyCat 节点菜单")
                 menu = capture_menu()
                 print(f"[扫描] 菜单中有 {len(menu)} 个节点", flush=True)
-                records: list[core.Node] = []
-                ips: dict[str, str] = {}
-                for position, (number, name) in enumerate(menu, 1):
-                    _status("running", f"正在扫描 {position}/{len(menu)}: {name}")
-                    _guard_update(scanning_started=True)
-                    try:
-                        record = scan_one(number, name, menu, work)
-                    finally:
-                        try:
-                            stop_vendor()
-                        finally:
-                            restore_route(baseline)
-                            restore_policy_rules(baseline_rules)
-                            _guard_update(scanning_started=False)
-                    exit_ip = probe_socks(record.server, record.server_port,
-                                          record.username, record.password)
-                    print(f"[上游] {name}: {exit_ip}", flush=True)
-                    records.append(record)
-                    ips[name] = exit_ip
-                    _guard_update()
-                if len(records) != len(menu):
-                    raise OnlineError("扫描结果与完整菜单数量不一致")
+                records, ips, node_status, skipped = _collect_nodes(
+                    menu, previous, work, baseline, baseline_rules)
                 state = core.reconcile_nodes(records, previous, master=master)
                 _status("running", "逐一验证 Shadowsocks 用户到出口的映射")
                 verify_candidate(binary, state, ips, work)
-                generation = _stage(state, master, binary, menu, ips)
+                generation = _stage(state, master, binary, menu, ips, node_status)
                 _status("running", "正在启动 OpenRC 服务")
                 _deploy(generation, binary, state, ips, work)
-                print(f"[完成] {len(menu)} 个出口，LXC TCP/UDP 端口 {PORT}", flush=True)
-                _status("ok", "LXC 本机服务已启动", nodes=len(menu), port=PORT)
+                print(f"[完成] {len(records)}/{len(menu)} 个出口可用，"
+                      f"LXC TCP/UDP 端口 {PORT}", flush=True)
+                if skipped:
+                    print("[跳过节点] " + "、".join(skipped), flush=True)
+                stale = [name for name, status in node_status.items() if status == "STALE"]
+                state_label = "partial" if skipped or stale else "ok"
+                _status(state_label, f"LXC 本机服务已启动（{len(records)}/{len(menu)} 个出口可用）",
+                        nodes=len(records), total=len(menu), skipped=skipped, stale=stale, port=PORT)
                 return 0
         except (OnlineError, preflight.PreflightError, OSError, ValueError,
                 subprocess.TimeoutExpired) as exc:
@@ -724,12 +791,13 @@ def _list() -> int:
         raise OnlineError("尚未安装")
     state = core.load_private_state(CURRENT / "state.json")
     meta = json.loads((CURRENT / "meta.json").read_text(encoding="utf-8"))
-    by_name = {entry["name"]: entry for entry in meta["nodes"]}
-    print("ID\tNAME\tUPSTREAM\tEXIT_IP")
-    for name, node in sorted(state["nodes"].items()):
-        entry = by_name.get(name, {})
-        print(f"{entry.get('id', '-')}\t{name}\t{node['server']}:{node['server_port']}"
-              f"\t{entry.get('exit_ip', '-')}")
+    print("ID\tNAME\tUPSTREAM\tEXIT_IP\tSTATUS")
+    for entry in meta["nodes"]:
+        name = entry["name"]
+        node = state["nodes"].get(name)
+        upstream = f"{node['server']}:{node['server_port']}" if node else "-"
+        print(f"{entry['id']}\t{name}\t{upstream}"
+              f"\t{entry.get('exit_ip') or '-'}\t{entry.get('status', '-')}")
     return 0
 
 
