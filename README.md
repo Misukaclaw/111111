@@ -32,12 +32,21 @@ lazycat-sync                 # 节点增删或凭据变化时重新扫描与部�
 lazycat-links HK_IP HK_PORT  # 输出客户端 ss:// 链接，含密钥，勿公开
 ```
 
-LXC 本机启动后，外网连接仍需要两段**一次性**配置；这些设置无法从 LXC 内自动代办。以 LazyCat NAT 公网端口 `32000`、香港机监听端口 `25000` 为例（实际端口自行选择）：
+LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端口 → 这台 LXC 的内部端口 12000`。公网端口可留空由平台分配，记下实际公网地址和端口。下面按香港机 3x-ui 的使用目标选择一种接法。
 
-1. LazyCat NAT 面板选择 **TCP**，添加 `公网端口 32000 → 这台 LXC 的内部端口 12000`。若公网端口留空由平台分配，记下实际分配值。
-2. 香港机 3x-ui「入站列表 → 添加入站」选 **Tunnel / Dokodemo-door**：监听地址留空或填 `0.0.0.0`，监听端口填 `25000`，`rewriteAddress` 填 LazyCat NAT 的公网地址，`rewritePort` 填其实际公网端口，`allowedNetwork` 选 `TCP`，`followRedirect` 关闭。该入站走 `direct` 出站，并在香港机防火墙放行 `25000/TCP`。一个 Tunnel 入站即可转发所有 SS 用户，香港机不解密 SS。
+### 香港 3x-ui 创建 VLESS 节点，经 LXC 出口上网
 
-之后使用 `lazycat-links HK_IP 25000` 生成的链接导入客户端。各链接的 HK 地址与端口相同，密钥不同。不要把 HK 的端口填成 LXC 内部的 `12000`，除非 HK 实际对外监听的就是这个端口。3x-ui 的 Tunnel 入站不会生成这 10 个 SS 用户的订阅链接；链接由 LXC 的 `lazycat-links` 输出。
+这是面板已有 VLESS 入站和 SS 出站时的接法：
+
+1. 在香港 3x-ui 的「出站 → 添加出站」为每个所需出口添加一个 **Shadowsocks** 出站。服务器地址和端口都填 LazyCat NAT 的公网地址和实际公网端口；加密方式填 `2022-blake3-aes-128-gcm`。密码必须是该出口专属的 `服务端密钥:用户密钥`，各出站密码不同。LXC 上的 `lazycat-links NAT_IP NAT_PORT` 可生成每个出口的 SS 链接，链接中的密码经过 URL 编码，需要解码后再填入面板；不要把链接或密码发到聊天或公开仓库。
+2. 在「入站」创建或复用香港机的 VLESS/Reality 节点。它的监听端口属于香港机，和 LXC 的 `12000`、LazyCat NAT 公网端口是三个不同概念。
+3. 在「路由」添加 `入站标签 → 对应的 SS 出站标签` 规则，并把它放在可能匹配同一流量的通用规则之前。先按 TCP 测试；若客户端还会发送 UDP，需要单独处理或阻断，避免落到香港机的默认出站。
+
+此时客户端导入 **3x-ui 生成的 VLESS 链接**。每个 VLESS 节点可以对应一个不同的 LXC 出口；这些 SS 出站共享同一个 LazyCat NAT 公网地址和端口，区别仅在密码。
+
+### 客户端直接使用 SS，香港机只做 TCP 转发
+
+若不需要 3x-ui 管理 VLESS 节点，可在香港 3x-ui「入站 → 添加入站」创建一个 **Tunnel / Dokodemo-door**：监听地址留空或填 `0.0.0.0`，监听端口自选，`rewriteAddress` 填 LazyCat NAT 的公网地址，`rewritePort` 填其实际公网端口，`allowedNetwork` 选 `TCP`，`followRedirect` 关闭。该入站走 `direct` 出站，在香港机防火墙放行其监听 TCP 端口。之后在 LXC 执行 `lazycat-links HK_IP HK_PORT`，将生成的 SS 链接导入客户端。3x-ui 的 Tunnel 入站不会生成这些 SS 用户的订阅链接。
 
 **TCP 映射的限制：** 普通 SS 客户端发出的原生 UDP 无法穿过这条 NAT 映射，游戏、语音以及某些 DNS/QUIC 功能可能无法使用。`ss://` 链接本身也不会自动启用 UDP over TCP。支持 sing-box UoT 的客户端可另行开启并实测；UoT 属于额外扩展，客户端版本和配置必须匹配。当前 `lazycat-test` 只验证 TCP/HTTPS 出口，不代表 UDP 已可用。
 
@@ -50,7 +59,7 @@ LXC 本机启动后，外网连接仍需要两段**一次性**配置；这些设
 - 本机测试只验证 TCP/HTTPS 的出口映射和 OpenRC 监听。UDP 数据、LazyCat NAT、HK 转发及手机客户端导入须在相应环境测试；`sing-box check` 也不能证明这些外部链路可用。
 - 如果 `proxy` 修改了本程序无法恢复的网络配置，`lazycat-status` 会显示恢复失败。只有 SSH 访问的机器仍可能需要管理方协助修复网络；请在可接受这项风险的测试 LXC 上试运行。
 
-协议配置依据：[sing-box Shadowsocks 多用户入站](https://sing-box.sagernet.org/configuration/inbound/shadowsocks/)、[按 `auth_user` 匹配的路由规则](https://sing-box.sagernet.org/configuration/route/rule/)、[SOCKS 出站](https://sing-box.sagernet.org/configuration/outbound/socks/)、[UoT 说明](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/)、[3x-ui Tunnel 表单](https://github.com/MHSanaei/3x-ui/blob/main/frontend/src/pages/inbounds/form/protocols/tunnel.tsx)、[Alpine 安装](https://sing-box.sagernet.org/installation/package-manager/)。
+协议配置依据：[sing-box Shadowsocks 多用户入站](https://sing-box.sagernet.org/configuration/inbound/shadowsocks/)、[按 `auth_user` 匹配的路由规则](https://sing-box.sagernet.org/configuration/route/rule/)、[SOCKS 出站](https://sing-box.sagernet.org/configuration/outbound/socks/)、[Xray SS 2022 密钥格式](https://xtls.github.io/en/config/inbounds/shadowsocks.html)、[Xray 入站到出站的路由规则](https://xtls.github.io/en/config/routing)、[UoT 说明](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/)、[3x-ui Tunnel 表单](https://github.com/MHSanaei/3x-ui/blob/main/frontend/src/pages/inbounds/form/protocols/tunnel.tsx)、[Alpine 安装](https://sing-box.sagernet.org/installation/package-manager/)。
 
 原始脚本的静态缺陷见 [ORIGINAL_SCRIPT_REVIEW.md](ORIGINAL_SCRIPT_REVIEW.md)。离线配置生成器仍可按 `python3 cli.py --help` 使用。运行合成测试：
 
