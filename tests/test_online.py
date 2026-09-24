@@ -142,6 +142,29 @@ class OnlineTests(unittest.TestCase):
         self.assertEqual(switch.call_args_list[1].args[0],
                          Path("/etc/lazycat-multi/generations/previous"))
 
+    def test_first_install_stops_service_before_removing_config(self):
+        current = Mock()
+        current.is_symlink.return_value = False
+        events = []
+        generation = Path("/etc/lazycat-multi/generations/new")
+
+        def switch(target):
+            events.append(("switch", target))
+
+        def service(command):
+            events.append(("service", command))
+
+        with patch.object(online, "CURRENT", current), \
+             patch.object(online, "_switch", side_effect=switch), \
+             patch.object(online, "_service", side_effect=service), \
+             patch.object(online, "_wait_service_port",
+                          side_effect=online.OnlineError("port unavailable")), \
+             patch.object(online.subprocess, "run", return_value=Mock(returncode=1)):
+            with self.assertRaisesRegex(online.OnlineError, "port unavailable"):
+                online._deploy(generation, "sing-box", {}, {}, Path("/tmp"))
+        self.assertEqual(events, [("switch", generation), ("service", "start"),
+                                  ("service", "stop"), ("switch", None)])
+
     def test_new_policy_rule_is_removed_without_touching_old_rules(self):
         baseline = {
             "-4": ["0: from all lookup local", "32766: from all lookup main"],

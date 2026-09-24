@@ -547,11 +547,21 @@ def _deploy(generation: Path, binary: str, state: dict[str, Any],
         if add.returncode:
             raise OnlineError("OpenRC 开机自启设置失败")
     except Exception:
-        _switch(previous)
-        try:
-            _service("restart" if was_running else "stop")
-        except OnlineError:
-            pass
+        if was_running and previous is not None:
+            _switch(previous)
+            try:
+                _service("restart")
+            except OnlineError:
+                pass
+        else:
+            # On a first install OpenRC can still be launching sing-box after
+            # `start` returns. Keep its config in place until it is stopped.
+            try:
+                _service("stop")
+            except OnlineError:
+                pass
+            else:
+                _switch(previous)
         raise
 
 
