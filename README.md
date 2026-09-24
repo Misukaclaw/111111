@@ -38,7 +38,27 @@ LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端�
 
 这是面板已有 VLESS 入站和 SS 出站时的接法：
 
-1. 在香港 3x-ui 的「出站 → 添加出站」为每个所需出口添加一个 **Shadowsocks** 出站。服务器地址和端口都填 LazyCat NAT 的公网地址和实际公网端口；加密方式填 `2022-blake3-aes-128-gcm`。密码必须是该出口专属的 `服务端密钥:用户密钥`，各出站密码不同。LXC 上的 `lazycat-links NAT_IP NAT_PORT` 可生成每个出口的 SS 链接，链接中的密码经过 URL 编码，需要解码后再填入面板；不要把链接或密码发到聊天或公开仓库。
+1. 在香港 3x-ui 的「出站 → 添加出站」为每个所需出口添加一个 **Shadowsocks** 出站。服务器地址和端口都填 LazyCat NAT 的公网地址和实际公网端口；加密方式填 `2022-blake3-aes-128-gcm`。密码必须是该出口专属的 `服务端密钥:用户密钥`，各出站密码不同。可在 LXC 的 root SSH 中运行下面的命令，一次显示所有可用节点的面板密码；输出只供本机复制，**不要发到聊天或公开仓库**：
+
+   ```sh
+   python3 - <<'PY'
+   import json
+   from pathlib import Path
+
+   base = Path('/etc/lazycat-multi/current')
+   state = json.loads((base / 'state.json').read_text())
+   meta = json.loads((base / 'meta.json').read_text())
+   for entry in meta['nodes']:
+       name = entry['name']
+       node = state['nodes'].get(name)
+       if node is None:
+           continue
+       print(name)
+       print('  加密方式: 2022-blake3-aes-128-gcm')
+       print('  密码: ' + state['server_key'] + ':' + node['user_key'])
+   PY
+   ```
+
 2. 在「入站」创建或复用香港机的 VLESS/Reality 节点。它的监听端口属于香港机，和 LXC 的 `12000`、LazyCat NAT 公网端口是三个不同概念。
 3. 在「路由」添加 `入站标签 → 对应的 SS 出站标签` 规则，并把它放在可能匹配同一流量的通用规则之前。先按 TCP 测试；若客户端还会发送 UDP，需要单独处理或阻断，避免落到香港机的默认出站。
 
