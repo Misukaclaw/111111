@@ -515,6 +515,22 @@ def _service(command: str) -> None:
         raise OnlineError(f"OpenRC {command} 失败")
 
 
+def _wait_service_port() -> None:
+    """OpenRC may report success before sing-box finishes binding the port."""
+    for _ in range(60):
+        try:
+            with socket.create_connection(("127.0.0.1", PORT), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.25)
+    running = subprocess.run(["rc-service", SERVICE, "status"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             timeout=8, check=False).returncode == 0
+    if not running:
+        raise OnlineError("OpenRC 服务启动后退出；请检查 /var/log/lazycat-multi/service.err")
+    raise OnlineError(f"OpenRC 已启动，但 {PORT} 端口在 15 秒内没有监听")
+
+
 def _deploy(generation: Path, binary: str, state: dict[str, Any],
             expected_ips: dict[str, str], work: Path) -> None:
     previous = CURRENT.resolve(strict=True) if CURRENT.is_symlink() else None
@@ -523,8 +539,7 @@ def _deploy(generation: Path, binary: str, state: dict[str, Any],
     try:
         _switch(generation)
         _service("restart" if was_running else "start")
-        with socket.create_connection(("127.0.0.1", PORT), timeout=4):
-            pass
+        _wait_service_port()
         _verify_routes(binary, state, expected_ips, work, PORT)
         add = subprocess.run(["rc-update", "add", SERVICE, "default"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

@@ -176,6 +176,26 @@ class OnlineTests(unittest.TestCase):
         self.assertEqual(switch.call_args_list[-1].args[0],
                          Path("/etc/lazycat-multi/generations/previous"))
 
+    def test_openrc_port_check_waits_for_listener(self):
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=None)
+        with patch.object(online.socket, "create_connection",
+                          side_effect=[ConnectionRefusedError(), ConnectionRefusedError(),
+                                       connection]) as connect, \
+             patch.object(online.time, "sleep") as sleep:
+            online._wait_service_port()
+        self.assertEqual(connect.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_openrc_port_check_reports_service_exit(self):
+        with patch.object(online.socket, "create_connection",
+                          side_effect=ConnectionRefusedError()), \
+             patch.object(online.time, "sleep"), \
+             patch.object(online.subprocess, "run", return_value=Mock(returncode=1)):
+            with self.assertRaisesRegex(online.OnlineError, "服务启动后退出"):
+                online._wait_service_port()
+
     def test_candidate_disables_other_upstreams_per_user(self):
         master = core.generate_master()
         state = core.reconcile_nodes([
