@@ -12,6 +12,7 @@ venv/
 *.trace.*
 *.strace
 *.log
+trace-*
 traces/
 captures/
 
@@ -20,6 +21,7 @@ master.json
 master.secret
 state.json
 config.json
+meta.json
 *.secret
 *.key
 *.pem

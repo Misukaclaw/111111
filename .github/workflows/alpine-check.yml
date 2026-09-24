@@ -1,0 +1,19 @@
+name: Alpine configuration check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check with Alpine and the packaged sing-box
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src alpine:3.23 sh -ec '
+            apk add --no-cache python3 sing-box strace iproute2
+            python3 -B -m unittest discover -v
+            python3 preflight.py
+            sh -n install.sh
+          '

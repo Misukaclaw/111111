@@ -1,0 +1,63 @@
+#!/bin/sh
+# Bootstrap from a public checkout on the target Alpine LXC.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || { echo '请以 root 运行' >&2; exit 1; }
+[ -f /etc/alpine-release ] || { echo '当前安装器仅支持 Alpine Linux' >&2; exit 1; }
+[ -x /usr/local/bin/proxy ] || { echo '找不到 LazyCat /usr/local/bin/proxy' >&2; exit 1; }
+
+SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TARGET_DIR=/usr/local/libexec/lazycat-multi
+SERVICE=/etc/init.d/lazycat-multi
+
+echo '[准备] 安装 Alpine 依赖...'
+apk add --no-cache python3 strace iproute2 openrc sing-box ca-certificates
+python3 -c 'import sys; assert sys.version_info >= (3, 10), "需要 Python 3.10+"'
+BINARY=$(command -v sing-box)
+
+if [ -L "$SERVICE" ]; then
+    echo '同名 OpenRC 服务是符号链接；停止安装' >&2
+    exit 1
+fi
+if [ -e "$SERVICE" ] && ! grep -q '^# Managed by lazycat-multi$' "$SERVICE"; then
+    echo '同名 OpenRC 服务已存在且不是本项目创建；停止安装' >&2
+    exit 1
+fi
+
+if [ -f /run/lazycat-multi/guard.json ]; then
+    echo '已有扫描任务在运行；先用 lazycat-status 查看进度' >&2
+    exit 1
+fi
+
+install -d -m 0755 "$TARGET_DIR"
+for name in core.py trace_parser.py preflight.py online.py cli.py; do
+    install -m 0644 "$SOURCE_DIR/$name" "$TARGET_DIR/$name"
+done
+install -d -m 0700 /etc/lazycat-multi /var/log/lazycat-multi
+
+cat > "$SERVICE" <<EOF
+#!/sbin/openrc-run
+# Managed by lazycat-multi
+name="LazyCat multi-exit"
+description="Single-port Shadowsocks 2022 multi-exit gateway"
+command="$BINARY"
+command_args="run -c /etc/lazycat-multi/current/config.json"
+supervisor=supervise-daemon
+output_log="/var/log/lazycat-multi/service.log"
+error_log="/var/log/lazycat-multi/service.err"
+depend() { need net; }
+EOF
+chmod 0755 "$SERVICE"
+
+for action in sync status list links test; do
+    cat > "/usr/local/bin/lazycat-$action" <<EOF
+#!/bin/sh
+exec python3 "$TARGET_DIR/online.py" "$action" "\$@"
+EOF
+    chmod 0755 "/usr/local/bin/lazycat-$action"
+done
+
+echo '[预检] 检查 sing-box 多用户配置...'
+python3 "$TARGET_DIR/preflight.py" --binary "$BINARY"
+echo '[开始] 后台扫描与部署；SSH 暂断时任务仍会继续。'
+exec python3 "$TARGET_DIR/online.py" install
