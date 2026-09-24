@@ -1,0 +1,34 @@
+# Python build and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Captures and logs can contain upstream proxy credentials.
+*.trace
+*.trace.*
+*.strace
+*.log
+traces/
+captures/
+
+# Never commit generated keys, state, runtime config, or private manifests.
+master.json
+master.secret
+state.json
+config.json
+*.secret
+*.key
+*.pem
+private/
+runtime/
+secrets/
+.env
+.env.*
+manifest.json
+manifest.*.json
+!manifest.example.json
+!examples/manifest.json

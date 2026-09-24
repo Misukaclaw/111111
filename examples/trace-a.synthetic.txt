@@ -1,0 +1,1 @@
+write(3, "{\"outbounds\":[{\"type\":\"socks\",\"server\":\"127.0.0.1\",\"server_port\":19001,\"username\":\"fake-user-a\",\"password\":\"fake-pass-a\"}]}", 123) = 123

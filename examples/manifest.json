@@ -1,0 +1,6 @@
+{
+  "nodes": [
+    {"name": "Synthetic A", "trace": "trace-a.synthetic.txt"},
+    {"name": "Synthetic B", "trace": "trace-b.synthetic.txt"}
+  ]
+}
