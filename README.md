@@ -28,8 +28,19 @@ lazycat-status
 lazycat-list                 # 节点、SOCKS 上游地址和实际出口 IP
 lazycat-test                 # 再次实测已启用的每个密钥和出口
 lazycat-status               # 后台任务、OpenRC 状态与最近日志
-lazycat-sync                 # 节点增删或凭据变化时重新扫描与部署
+lazycat-sync                 # 节点增删或凭据变化时重新扫描与部署；已有节点的密码不变
+lazycat-export               # 显示加密方式、内部端口和每个节点的密码（含密钥，勿公开）
+lazycat-export --tsv         # 每行「节点名<TAB>密码」，便于批量导入面板
+lazycat-export --backup      # 额外显示恢复码，重装小鸡后用它找回全部旧密码
 lazycat-links HK_IP HK_PORT  # 输出客户端 ss:// 链接，含密钥，勿公开
+```
+
+**密码会不会变：** 每个节点的密码由主密钥和节点名算出。主密钥首次安装时生成，单独保存在 `/etc/lazycat-multi/master.json`，之后每次 `lazycat-sync` 都沿用，所以已有节点的密码不变，只有新出现的节点会多出新密码。`lazycat-status` 和 `lazycat-export` 都会显示「主密钥指纹」，同步前后应完全一致。只有重装小鸡系统会丢失主密钥：重装前运行 `lazycat-export --backup` 记下恢复码，重装后用 `LC_MASTER='恢复码' sh /root/lazycat-multi/install.sh` 安装，全部密码与重装前相同。
+
+**只更新程序、不重新扫描：**
+
+```sh
+git -C /root/lazycat-multi pull --ff-only && sh /root/lazycat-multi/install.sh --no-scan
 ```
 
 LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端口 → 这台 LXC 的内部端口 12000`。公网端口可留空由平台分配，记下实际公网地址和端口。下面按香港机 3x-ui 的使用目标选择一种接法。
@@ -38,26 +49,7 @@ LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端�
 
 这是面板已有 VLESS 入站和 SS 出站时的接法：
 
-1. 在香港 3x-ui 的「出站 → 添加出站」为每个所需出口添加一个 **Shadowsocks** 出站。服务器地址和端口都填 LazyCat NAT 的公网地址和实际公网端口；加密方式填 `2022-blake3-aes-128-gcm`。密码必须是该出口专属的 `服务端密钥:用户密钥`，各出站密码不同。可在 LXC 的 root SSH 中运行下面的命令，一次显示所有可用节点的面板密码；输出只供本机复制，**不要发到聊天或公开仓库**：
-
-   ```sh
-   python3 - <<'PY'
-   import json
-   from pathlib import Path
-
-   base = Path('/etc/lazycat-multi/current')
-   state = json.loads((base / 'state.json').read_text())
-   meta = json.loads((base / 'meta.json').read_text())
-   for entry in meta['nodes']:
-       name = entry['name']
-       node = state['nodes'].get(name)
-       if node is None:
-           continue
-       print(name)
-       print('  加密方式: 2022-blake3-aes-128-gcm')
-       print('  密码: ' + state['server_key'] + ':' + node['user_key'])
-   PY
-   ```
+1. 在香港 3x-ui 的「出站 → 添加出站」为每个所需出口添加一个 **Shadowsocks** 出站。服务器地址和端口都填 LazyCat NAT 的公网地址和实际公网端口；加密方式填 `2022-blake3-aes-128-gcm`。密码必须是该出口专属的 `服务端密钥:用户密钥`，各出站密码不同。可在 LXC 的 root SSH 中运行 `lazycat-export`，一次显示所有可用节点的面板密码；输出只供本机复制，**不要发到聊天或公开仓库**。
 
 2. 在「入站」创建或复用香港机的 VLESS/Reality 节点。它的监听端口属于香港机，和 LXC 的 `12000`、LazyCat NAT 公网端口是三个不同概念。
 3. 在「路由」添加 `入站标签 → 对应的 SS 出站标签` 规则，并把它放在可能匹配同一流量的通用规则之前。先按 TCP 测试；若客户端还会发送 UDP，需要单独处理或阻断，避免落到香港机的默认出站。
@@ -75,7 +67,7 @@ LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端�
 - 扫描一次只接受完整、无重复的菜单；每个节点 trace 必须含唯一、完整写入的 SOCKS 配置。单个节点抓取或出口验证失败会跳过该节点；同名旧节点若仍可连接，会暂用旧上游并标为 `STALE`。菜单中没有任何可用出口、菜单中途变化或网络路由恢复失败时，整次同步不切换正式配置。
 - 每个上游先通过 SOCKS5 验证 HTTPS 出口 IP；候选 sing-box 在回环地址运行，再用各 SS 用户密钥逐一验证路由。正式 OpenRC 服务启动后会重复用户到出口验证，失败则回滚。
 - `proxy` 的节点选择会启动供应商 TUN。扫描任务脱离 SSH 会话运行；每次选择后调用供应商菜单停止 TUN，核对并尝试恢复默认路由与策略规则。看门狗负责处理任务意外退出或长时间无进展。
-- 主密钥、SOCKS 凭据、配置及出口清单保存在 LXC 的 `/etc/lazycat-multi/generations/`，目录权限 `0700`、文件 `0600`。GitHub 仓库只含程序和虚构测试样本。备份当前的 `/etc/lazycat-multi/current/master.json`；重装时把其中 `master` 字段的值用于 `LC_MASTER='该字段的值' sh /root/lazycat-multi/install.sh`，即可恢复相同客户端密钥。若已有主密钥，环境值不一致会报错。
+- 主密钥保存在 `/etc/lazycat-multi/master.json`，SOCKS 凭据、配置及出口清单保存在 `/etc/lazycat-multi/generations/`，目录权限 `0700`、文件 `0600`。GitHub 仓库只含程序和虚构测试样本。`current` 链接意外丢失时，程序从 `master.json` 或最新一版配置中找回主密钥，不会另生成新密钥；若 `LC_MASTER` 与已有主密钥不一致会报错，不会静默更换全部密码。
 - 本机测试只验证 TCP/HTTPS 的出口映射和 OpenRC 监听。UDP 数据、LazyCat NAT、HK 转发及手机客户端导入须在相应环境测试；`sing-box check` 也不能证明这些外部链路可用。
 - 如果 `proxy` 修改了本程序无法恢复的网络配置，`lazycat-status` 会显示恢复失败。只有 SSH 访问的机器仍可能需要管理方协助修复网络；请在可接受这项风险的测试 LXC 上试运行。
 

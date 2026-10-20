@@ -1,7 +1,10 @@
 """Checks for online discovery boundaries and deployment rollback."""
 
+import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -252,6 +255,116 @@ class OnlineTests(unittest.TestCase):
                 else:
                     self.assertEqual((outbound["server"], outbound["server_port"]),
                                      ("127.0.0.1", 1))
+
+
+class MasterKeyTests(unittest.TestCase):
+    """Client passwords must survive a lost `current` link and every sync."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for name, value in (("APP", self.root),
+                            ("GENERATIONS", self.root / "generations"),
+                            ("CURRENT", self.root / "current"),
+                            ("MASTER_FILE", self.root / "master.json")):
+            patcher = patch.object(online, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("LC_MASTER", None)
+
+    def _generation(self, name, master, mtime):
+        path = self.root / "generations" / name
+        path.mkdir(parents=True)
+        (path / "master.json").write_text(json.dumps({"master": master}), encoding="utf-8")
+        os.utime(path / "master.json", (mtime, mtime))
+
+    def test_fresh_install_generates_a_master(self):
+        master, state = online._load_previous()
+        self.assertIsNone(state)
+        core.derive_server_key(master)
+
+    def test_lost_current_reuses_saved_master(self):
+        saved = core.generate_master()
+        (self.root / "master.json").write_text(json.dumps({"master": saved}), encoding="utf-8")
+        self.assertEqual(online._load_previous(), (saved, None))
+
+    def test_lost_current_recovers_newest_generation_master(self):
+        old, new = core.generate_master(), core.generate_master()
+        self._generation("generation-old", old, 1_000_000)
+        self._generation("generation-new", new, 2_000_000)
+        self.assertEqual(online._load_previous()[0], new)
+
+    def test_recovered_keys_match_previous_passwords(self):
+        master = core.generate_master()
+        before = core.reconcile_nodes([core.Node("a", "192.0.2.1", 5001, "u", "p")], master=master)
+        self._generation("generation-x", master, 1_000_000)
+        recovered, previous = online._load_previous()
+        after = core.reconcile_nodes([core.Node("a", "192.0.2.9", 6001, "u2", "p2")],
+                                     previous, master=recovered)
+        self.assertEqual(after["server_key"], before["server_key"])
+        self.assertEqual(after["nodes"]["a"]["user_key"], before["nodes"]["a"]["user_key"])
+
+    def test_lc_master_cannot_silently_replace_recovered_master(self):
+        self._generation("generation-x", core.generate_master(), 1_000_000)
+        os.environ["LC_MASTER"] = core.generate_master()
+        with self.assertRaisesRegex(online.OnlineError, "LC_MASTER"):
+            online._load_previous()
+
+    def test_lc_master_restores_keys_on_a_reinstalled_box(self):
+        master = core.generate_master()
+        os.environ["LC_MASTER"] = master
+        self.assertEqual(online._load_previous(), (master, None))
+
+    def test_persisted_master_refuses_rotation(self):
+        first, second = core.generate_master(), core.generate_master()
+        online._persist_master(first)
+        online._persist_master(first)
+        with self.assertRaisesRegex(online.OnlineError, "不一致"):
+            online._persist_master(second)
+        saved = json.loads((self.root / "master.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["master"], first)
+
+
+class ExportTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.master = core.generate_master()
+        self.state = core.reconcile_nodes([
+            core.Node("HKT", "192.0.2.1", 5001, "u1", "p1"),
+            core.Node("KDDI", "192.0.2.2", 5002, "u2", "p2"),
+        ], master=self.master)
+        core.save_private_state(self.base / "state.json", self.state)
+        core.save_private_json(self.base / "master.json", {"master": self.master})
+        core.save_private_json(self.base / "meta.json", {"nodes": [
+            {"id": 1, "name": "KDDI", "exit_ip": "192.0.2.10", "status": "OK"},
+            {"id": 2, "name": "Bell", "exit_ip": "", "status": "SKIPPED"},
+            {"id": 3, "name": "HKT", "exit_ip": "192.0.2.11", "status": "STALE"},
+        ]})
+
+    def password(self, name):
+        return self.state["server_key"] + ":" + self.state["nodes"][name]["user_key"]
+
+    def test_tsv_lists_enabled_nodes_in_menu_order(self):
+        self.assertEqual(online.export_lines(self.base, tsv=True),
+                         [f"KDDI\t{self.password('KDDI')}", f"HKT\t{self.password('HKT')}"])
+
+    def test_readable_export_marks_status_and_skipped_nodes(self):
+        text = "\n".join(online.export_lines(self.base))
+        self.assertIn("加密: 2022-blake3-aes-128-gcm", text)
+        self.assertIn(f"主密钥指纹: {self.state['master_id'][:12]}", text)
+        self.assertIn("节点: HKT  [STALE]", text)
+        self.assertIn(f"密码: {self.password('KDDI')}", text)
+        self.assertIn("未启用: Bell", text)
+        self.assertNotIn(self.master, text)
+
+    def test_backup_adds_recovery_code(self):
+        self.assertIn(self.master, online.export_lines(self.base, backup=True))
 
 
 if __name__ == "__main__":

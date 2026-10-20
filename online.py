@@ -40,6 +40,9 @@ from trace_parser import TraceParseError, extract_socks_outbound
 APP = Path("/etc/lazycat-multi")
 GENERATIONS = APP / "generations"
 CURRENT = APP / "current"
+# The master seed derives every client key. It lives outside the generations
+# so that losing the `current` link never silently rotates all passwords.
+MASTER_FILE = APP / "master.json"
 RUNTIME = Path("/run/lazycat-multi")
 LOG = Path("/var/log/lazycat-multi/install.log")
 GUARD = RUNTIME / "guard.json"
@@ -455,19 +458,48 @@ def verify_candidate(binary: str, state: dict[str, Any], expected_ips: dict[str,
             _terminate_process(server)
 
 
+def _recover_master() -> str | None:
+    """Return the saved master seed, else the one from the newest generation."""
+    if MASTER_FILE.is_file():
+        return json.loads(MASTER_FILE.read_text(encoding="utf-8"))["master"]
+    copies = sorted(GENERATIONS.glob("generation-*/master.json"),
+                    key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in copies:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))["master"]
+        except (OSError, ValueError, KeyError):
+            continue
+    return None
+
+
 def _load_previous() -> tuple[str, dict[str, Any] | None]:
+    wanted = os.environ.get("LC_MASTER")
     if not CURRENT.is_symlink():
         if CURRENT.exists():
             raise OnlineError("现有 current 不是符号链接")
-        return core.generate_master(), None
-    target = CURRENT.resolve(strict=True)
-    if GENERATIONS not in target.parents:
-        raise OnlineError("现有配置路径不在受管目录")
-    state = core.load_private_state(target / "state.json")
-    master = json.loads((target / "master.json").read_text(encoding="utf-8"))["master"]
-    if os.environ.get("LC_MASTER") and os.environ["LC_MASTER"] != master:
+        # A failed or interrupted run can drop `current`; keep the old keys anyway.
+        master, state = _recover_master(), None
+    else:
+        target = CURRENT.resolve(strict=True)
+        if GENERATIONS not in target.parents:
+            raise OnlineError("现有配置路径不在受管目录")
+        state = core.load_private_state(target / "state.json")
+        master = json.loads((target / "master.json").read_text(encoding="utf-8"))["master"]
+    if master is None:
+        return wanted or core.generate_master(), None
+    if wanted and wanted != master:
         raise OnlineError("LC_MASTER 与已安装的恢复密钥不一致")
     return master, state
+
+
+def _persist_master(master: str) -> None:
+    """Pin the master seed for the life of the install; never rotate it silently."""
+    if MASTER_FILE.is_file():
+        if json.loads(MASTER_FILE.read_text(encoding="utf-8"))["master"] != master:
+            raise OnlineError(f"{MASTER_FILE} 与本次使用的主密钥不一致；"
+                              "如确需更换全部密码，先手动移走该文件")
+        return
+    core.save_private_json(MASTER_FILE, {"master": master})
 
 
 def _stage(state: dict[str, Any], master: str, binary: str,
@@ -676,9 +708,9 @@ def _worker(operation: str) -> int:
             if not SERVICE_FILE.is_file():
                 raise OnlineError("OpenRC 服务文件未安装")
             binary = preflight.run("sing-box")
-            previous_master, previous = _load_previous()
-            master = os.environ.get("LC_MASTER") or previous_master
+            master, previous = _load_previous()
             core.derive_server_key(master)
+            _persist_master(master)
             with tempfile.TemporaryDirectory(prefix="scan-", dir=RUNTIME) as directory:
                 work = Path(directory)
                 _status("running", "正在读取 LazyCat 节点菜单")
@@ -804,6 +836,8 @@ def _show_status() -> int:
         result = subprocess.run(["rc-service", SERVICE, "status"], capture_output=True,
                                 text=True, check=False)
         print("OpenRC: running" if result.returncode == 0 else "OpenRC: stopped")
+        state = core.load_private_state(CURRENT / "state.json")
+        print(f"主密钥指纹: {state['master_id'][:12]}（同步前后应保持不变）")
     if LOG.exists():
         print("最近日志:")
         for line in LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-12:]:
@@ -852,11 +886,47 @@ def _links(host: str, port: int) -> int:
     return 0
 
 
+def export_lines(base: Path, *, tsv: bool = False, backup: bool = False) -> list[str]:
+    """Client passwords of the enabled nodes, in LazyCat menu order."""
+    state = core.load_private_state(base / "state.json")
+    meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
+    status = {entry["name"]: entry.get("status", "-") for entry in meta["nodes"]}
+    names = [entry["name"] for entry in meta["nodes"] if entry["name"] in state["nodes"]]
+    names += sorted(set(state["nodes"]) - set(names))
+
+    def password(name: str) -> str:
+        return state["server_key"] + ":" + state["nodes"][name]["user_key"]
+
+    if tsv:
+        return [f"{name}\t{password(name)}" for name in names]
+    lines = [f"加密: {core.METHOD}", f"内部端口: {PORT}",
+             f"主密钥指纹: {state['master_id'][:12]}（同步前后应保持不变）", ""]
+    for name in names:
+        lines += [f"节点: {name}  [{status.get(name, '-')}]", f"密码: {password(name)}", ""]
+    skipped = [entry["name"] for entry in meta["nodes"] if entry["name"] not in state["nodes"]]
+    if skipped:
+        lines += ["本次扫描失败、未启用: " + "、".join(skipped), ""]
+    if backup:
+        master = json.loads((base / "master.json").read_text(encoding="utf-8"))["master"]
+        lines += ["恢复码（小鸡重装后用它找回全部旧密码；离线保存，勿外传）:", master,
+                  "重装时这样安装: LC_MASTER='恢复码' sh /root/lazycat-multi/install.sh"]
+    return lines
+
+
+def _export(tsv: bool, backup: bool) -> int:
+    if not CURRENT.is_symlink():
+        raise OnlineError("尚未安装")
+    print("\n".join(export_lines(CURRENT, tsv=tsv, backup=backup)))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["install", "sync", "status", "list", "links", "test",
-                                            "_worker", "_watchdog"])
+                                            "export", "_worker", "_watchdog"])
     parser.add_argument("extra", nargs="*")
+    parser.add_argument("--tsv", action="store_true", help="export: '节点名<TAB>密码' 每行一个")
+    parser.add_argument("--backup", action="store_true", help="export: 同时输出恢复码")
     args = parser.parse_args(argv)
     try:
         if args.command in ("install", "sync"):
@@ -871,6 +941,8 @@ def main(argv: list[str] | None = None) -> int:
             return _list()
         if args.command == "test":
             return _test()
+        if args.command == "export":
+            return _export(args.tsv, args.backup)
         if len(args.extra) != 2:
             raise OnlineError("用法: lazycat-links HK_HOST HK_PORT")
         return _links(args.extra[0], int(args.extra[1]))

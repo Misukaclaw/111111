@@ -1,6 +1,15 @@
 #!/bin/sh
 # Bootstrap from a public checkout on the target Alpine LXC.
+# --no-scan: only update the program and commands; keep the running config.
 set -eu
+
+NO_SCAN=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-scan) NO_SCAN=1 ;;
+        *) echo "未知参数: $arg" >&2; exit 1 ;;
+    esac
+done
 
 [ "$(id -u)" -eq 0 ] || { echo '请以 root 运行' >&2; exit 1; }
 [ -f /etc/alpine-release ] || { echo '当前安装器仅支持 Alpine Linux' >&2; exit 1; }
@@ -49,7 +58,7 @@ depend() { need net; }
 EOF
 chmod 0755 "$SERVICE"
 
-for action in sync status list links test; do
+for action in sync status list links test export; do
     cat > "/usr/local/bin/lazycat-$action" <<EOF
 #!/bin/sh
 exec python3 "$TARGET_DIR/online.py" "$action" "\$@"
@@ -59,5 +68,9 @@ done
 
 echo '[预检] 检查 sing-box 多用户配置...'
 python3 "$TARGET_DIR/preflight.py" --binary "$BINARY"
+if [ "$NO_SCAN" -eq 1 ]; then
+    echo '[完成] 程序和命令已更新；未扫描节点，正在运行的配置与密码不变。'
+    exit 0
+fi
 echo '[开始] 后台扫描与部署；SSH 暂断时任务仍会继续。'
 exec python3 "$TARGET_DIR/online.py" install
