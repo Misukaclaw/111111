@@ -136,6 +136,7 @@ class OnlineTests(unittest.TestCase):
         with patch.object(online, "CURRENT", current), \
              patch.object(online, "_switch") as switch, \
              patch.object(online, "_service", service), \
+             patch.object(online, "_wait_service_port"), \
              patch.object(online.subprocess, "run", return_value=Mock(returncode=0)):
             with self.assertRaises(online.OnlineError):
                 online._deploy(Path("/etc/lazycat-multi/generations/new"), "sing-box",
@@ -167,6 +168,87 @@ class OnlineTests(unittest.TestCase):
                 online._deploy(generation, "sing-box", {}, {}, Path("/tmp"))
         self.assertEqual(events, [("switch", generation), ("service", "start"),
                                   ("service", "stop"), ("switch", None)])
+
+    def test_rollback_revives_previous_config_when_gateway_was_already_down(self):
+        # The reported failure: the gateway died during the scan, the new
+        # config would not start, and the rollback left everything stopped.
+        current = Mock()
+        current.is_symlink.return_value = True
+        current.resolve.return_value = Path("/etc/lazycat-multi/generations/previous")
+        events = []
+        commands = []
+
+        def run(argv, **kwargs):
+            commands.append(argv)
+            return Mock(returncode=1)  # OpenRC reports "crashed"/stopped
+
+        with patch.object(online, "CURRENT", current), \
+             patch.object(online, "_switch", side_effect=lambda t: events.append(("switch", t))), \
+             patch.object(online, "_service", side_effect=lambda c: events.append(("service", c))), \
+             patch.object(online, "_wait_service_port",
+                          side_effect=[online.OnlineError("服务启动后退出"), None]), \
+             patch.object(online.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(online.OnlineError, "启动后退出"):
+                online._deploy(Path("/etc/lazycat-multi/generations/new"), "sing-box",
+                               {}, {}, Path("/tmp"))
+        self.assertEqual(events, [
+            ("switch", Path("/etc/lazycat-multi/generations/new")), ("service", "start"),
+            ("switch", Path("/etc/lazycat-multi/generations/previous")), ("service", "start")])
+        self.assertEqual(commands.count(["rc-service", online.SERVICE, "zap"]), 2)
+
+    def test_start_service_clears_crashed_state_and_orphan_first(self):
+        commands = []
+
+        def run(argv, **kwargs):
+            commands.append(argv)
+            return Mock(returncode=1)
+
+        with patch.object(online.subprocess, "run", side_effect=run), \
+             patch.object(online, "_service") as service:
+            online._start_service()
+        self.assertIn(["rc-service", online.SERVICE, "zap"], commands)
+        self.assertIn(["pkill", "-f", f"run -c {online.CURRENT}/config.json"], commands)
+        service.assert_called_once_with("start")
+
+    def test_start_service_restarts_a_running_gateway(self):
+        with patch.object(online.subprocess, "run", return_value=Mock(returncode=0)) as run, \
+             patch.object(online, "_service") as service:
+            online._start_service()
+        service.assert_called_once_with("restart")
+        self.assertEqual(run.call_count, 1)
+
+    def test_sync_end_revives_a_stopped_gateway(self):
+        current = Mock()
+        current.is_symlink.return_value = True
+        with patch.object(online, "CURRENT", current), \
+             patch.object(online, "_service_running", return_value=False), \
+             patch.object(online, "_start_service") as start, \
+             patch.object(online, "_wait_service_port") as wait:
+            online._ensure_running()
+        start.assert_called_once()
+        wait.assert_called_once()
+
+    def test_sync_end_leaves_a_running_gateway_alone(self):
+        current = Mock()
+        current.is_symlink.return_value = True
+        with patch.object(online, "CURRENT", current), \
+             patch.object(online, "_service_running", return_value=True), \
+             patch.object(online, "_start_service") as start:
+            online._ensure_running()
+        start.assert_not_called()
+
+    def test_service_exit_message_includes_last_gateway_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            err = Path(directory) / "service.err"
+            err.write_text("old line\nFATAL start inbound: listen tcp 0.0.0.0:12000: "
+                           "bind: address already in use\n", encoding="utf-8")
+            with patch.object(online, "SERVICE_ERR", err), \
+                 patch.object(online.socket, "create_connection",
+                              side_effect=ConnectionRefusedError()), \
+                 patch.object(online.time, "sleep"), \
+                 patch.object(online.subprocess, "run", return_value=Mock(returncode=1)):
+                with self.assertRaisesRegex(online.OnlineError, "address already in use"):
+                    online._wait_service_port()
 
     def test_new_policy_rule_is_removed_without_touching_old_rules(self):
         baseline = {

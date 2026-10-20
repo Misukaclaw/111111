@@ -65,6 +65,7 @@ LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端�
 ## 实现与边界
 
 - 扫描一次只接受完整、无重复的菜单；每个节点 trace 必须含唯一、完整写入的 SOCKS 配置。单个节点抓取或出口验证失败会跳过该节点；同名旧节点若仍可连接，会暂用旧上游并标为 `STALE`。菜单中没有任何可用出口、菜单中途变化或网络路由恢复失败时，整次同步不切换正式配置。
+- 网关用重命名的 sing-box 副本 `/usr/local/libexec/lazycat-multi/gateway` 运行，避免 LazyCat 停止菜单按进程名 `sing-box` 清理时误杀；OpenRC 对它无限次自动重启。同步结束时不论成败都会检查网关，若扫描期间被停掉会自动重新启动；新配置启动失败则退回上一版并重新启动网关，不会让全部节点停在 -1。`lazycat-status` 若显示 `OpenRC: stopped`，运行 `sh /root/lazycat-multi/install.sh --no-scan` 即可拉起。
 - 每个上游先通过 SOCKS5 验证 HTTPS 出口 IP；候选 sing-box 在回环地址运行，再用各 SS 用户密钥逐一验证路由。正式 OpenRC 服务启动后会重复用户到出口验证，失败则回滚。
 - `proxy` 的节点选择会启动供应商 TUN。扫描任务脱离 SSH 会话运行；每次选择后调用供应商菜单停止 TUN，核对并尝试恢复默认路由与策略规则。看门狗负责处理任务意外退出或长时间无进展。
 - 主密钥保存在 `/etc/lazycat-multi/master.json`，SOCKS 凭据、配置及出口清单保存在 `/etc/lazycat-multi/generations/`，目录权限 `0700`、文件 `0600`。GitHub 仓库只含程序和虚构测试样本。`current` 链接意外丢失时，程序从 `master.json` 或最新一版配置中找回主密钥，不会另生成新密钥；若 `LC_MASTER` 与已有主密钥不一致会报错，不会静默更换全部密码。

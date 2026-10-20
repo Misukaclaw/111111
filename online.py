@@ -43,6 +43,10 @@ CURRENT = APP / "current"
 # The master seed derives every client key. It lives outside the generations
 # so that losing the `current` link never silently rotates all passwords.
 MASTER_FILE = APP / "master.json"
+# install.sh runs the gateway from a renamed copy of sing-box, so vendor
+# clean-ups that kill processes named "sing-box" do not take it down mid-scan.
+GATEWAY = Path("/usr/local/libexec/lazycat-multi/gateway")
+SERVICE_ERR = Path("/var/log/lazycat-multi/service.err")
 RUNTIME = Path("/run/lazycat-multi")
 LOG = Path("/var/log/lazycat-multi/install.log")
 GUARD = RUNTIME / "guard.json"
@@ -540,11 +544,47 @@ def _switch(target: Path | None) -> None:
     os.replace(temporary, CURRENT)
 
 
+def _gateway_binary() -> str:
+    """The renamed copy the service runs; checks must use the same binary."""
+    return str(GATEWAY) if GATEWAY.is_file() else "sing-box"
+
+
 def _service(command: str) -> None:
     result = subprocess.run(["rc-service", SERVICE, command], stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, timeout=25, check=False)
     if result.returncode:
         raise OnlineError(f"OpenRC {command} 失败")
+
+
+def _service_running() -> bool:
+    return subprocess.run(["rc-service", SERVICE, "status"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=8, check=False).returncode == 0
+
+
+def _start_service() -> None:
+    """Start or restart the gateway, also after its daemon was killed.
+
+    A killed supervise-daemon leaves OpenRC "crashed", where `start` silently
+    does nothing. Clear that state and any orphaned gateway still holding the
+    port (matched by its exact config argument) before starting again.
+    """
+    if _service_running():
+        _service("restart")
+        return
+    subprocess.run(["rc-service", SERVICE, "zap"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=10, check=False)
+    subprocess.run(["pkill", "-f", f"run -c {CURRENT}/config.json"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=10, check=False)
+    _service("start")
+
+
+def _service_error_hint() -> str:
+    """The gateway's last stderr line (sing-box errors carry no keys)."""
+    try:
+        lines = SERVICE_ERR.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except OSError:
+        return ""
+    return f"；最后的错误: {lines[-1][-200:]}" if lines else ""
 
 
 def _wait_service_port() -> None:
@@ -555,22 +595,31 @@ def _wait_service_port() -> None:
                 return
         except OSError:
             time.sleep(0.25)
-    running = subprocess.run(["rc-service", SERVICE, "status"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             timeout=8, check=False).returncode == 0
-    if not running:
-        raise OnlineError("OpenRC 服务启动后退出；请检查 /var/log/lazycat-multi/service.err")
+    if not _service_running():
+        raise OnlineError(f"OpenRC 服务启动后退出；请检查 {SERVICE_ERR}{_service_error_hint()}")
     raise OnlineError(f"OpenRC 已启动，但 {PORT} 端口在 15 秒内没有监听")
+
+
+def _ensure_running() -> None:
+    """Whatever happened during a sync, leave the installed gateway serving."""
+    if not CURRENT.is_symlink() or _service_running():
+        return
+    print("[恢复] 网关服务在同步期间被停止，正在重新启动", flush=True)
+    try:
+        _start_service()
+        _wait_service_port()
+    except (OnlineError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[恢复] 网关仍未启动: {exc}", flush=True)
+    else:
+        print("[恢复] 网关已重新启动", flush=True)
 
 
 def _deploy(generation: Path, binary: str, state: dict[str, Any],
             expected_ips: dict[str, str], work: Path) -> None:
     previous = CURRENT.resolve(strict=True) if CURRENT.is_symlink() else None
-    was_running = subprocess.run(["rc-service", SERVICE, "status"], stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, timeout=8, check=False).returncode == 0
     try:
         _switch(generation)
-        _service("restart" if was_running else "start")
+        _start_service()
         _wait_service_port()
         _verify_routes(binary, state, expected_ips, work, PORT)
         add = subprocess.run(["rc-update", "add", SERVICE, "default"],
@@ -579,12 +628,17 @@ def _deploy(generation: Path, binary: str, state: dict[str, Any],
         if add.returncode:
             raise OnlineError("OpenRC 开机自启设置失败")
     except Exception:
-        if was_running and previous is not None:
+        if previous is not None:
+            # Bring the last good config back up even if the gateway was
+            # already down before this sync (e.g. killed during the scan).
             _switch(previous)
             try:
-                _service("restart")
-            except OnlineError:
-                pass
+                _start_service()
+                _wait_service_port()
+            except OnlineError as exc:
+                print(f"[回滚] 已恢复上一版配置，但网关未能启动: {exc}", flush=True)
+            else:
+                print("[回滚] 已恢复上一版配置并重新启动网关", flush=True)
         else:
             # On a first install OpenRC can still be launching sing-box after
             # `start` returns. Keep its config in place until it is stopped.
@@ -707,7 +761,7 @@ def _worker(operation: str) -> int:
                 raise OnlineError("找不到 LazyCat proxy 程序")
             if not SERVICE_FILE.is_file():
                 raise OnlineError("OpenRC 服务文件未安装")
-            binary = preflight.run("sing-box")
+            binary = preflight.run(_gateway_binary())
             master, previous = _load_previous()
             core.derive_server_key(master)
             _persist_master(master)
@@ -759,6 +813,7 @@ def _worker(operation: str) -> int:
                     watcher.wait(timeout=6)
                 except subprocess.TimeoutExpired:
                     pass
+                _ensure_running()
 
 
 def _watchdog() -> int:
@@ -863,7 +918,7 @@ def _list() -> int:
 def _test() -> int:
     if not CURRENT.is_symlink():
         raise OnlineError("尚未安装")
-    binary = preflight.run("sing-box")
+    binary = preflight.run(_gateway_binary())
     state = core.load_private_state(CURRENT / "state.json")
     expected: dict[str, str] = {}
     for name, node in state["nodes"].items():
