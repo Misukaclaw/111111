@@ -12,13 +12,13 @@
 apk add --no-cache git && (git -C /root/lazycat-multi pull --ff-only || git clone https://github.com/Misukaclaw/111111.git /root/lazycat-multi) && sh /root/lazycat-multi/install.sh
 ```
 
-这条命令安装依赖、检查 sing-box 是否接受双用户配置，然后启动独立后台任务。扫描时 LazyCat 可能切换默认路由，SSH 可能短暂断开；后台任务会继续，超时看门狗会尝试停止 LazyCat TUN 并恢复扫描前的默认路由及策略规则。重新连接后运行：
+这条命令安装依赖、检查 sing-box 是否接受双用户配置，然后启动独立后台任务，并在当前窗口实时显示进度；结束时直接列出结果、网关状态和每个节点的密码（新出现的节点标「新增」，菜单里已消失的节点单独列出）。扫描时 LazyCat 可能切换默认路由，SSH 可能短暂断开；后台任务会继续，超时看门狗会尝试停止 LazyCat TUN 并恢复扫描前的默认路由及策略规则。按 Ctrl+C 或 SSH 断开只会停止显示，不会中断同步。重新连接后运行：
 
 ```sh
 lazycat-status
 ```
 
-看到 `ok` 或 `partial: LXC 本机服务已启动`，并且 `OpenRC: running`，才表示 LXC 本机已有可用出口。`partial` 表示有节点被跳过，用 `lazycat-list` 查看具体名称。看到 `failed` 时，把 `lazycat-status` 的完整输出发来排查；**不要发送** `/etc/lazycat-multi/` 下的 JSON、原始 trace 或带密钥的链接。
+看到 `ok` 或 `partial: LXC 本机服务已启动`，并且 `OpenRC: running`，才表示 LXC 本机已有可用出口。`partial` 表示有节点被跳过，用 `lazycat-list` 查看具体名称；完成后用 `lazycat-export` 查看密码。看到 `failed` 时，把 `lazycat-status` 的完整输出发来排查（它不含密钥，第二行「程序版本」可看出小鸡上的程序是否已更新）；**不要发送** `/etc/lazycat-multi/` 下的 JSON、原始 trace 或带密钥的链接。
 
 安装器要求：Alpine Linux、root、现存 `/usr/local/bin/proxy`、一条未指向 `cat0` 的 IPv4 默认路由、可用的 `apk` 源。若不满足条件，会停止而不开始节点扫描。首次通过 SSH 自动抓取节点仍有失联风险；看门狗只能按扫描前快照尝试恢复，不能保证处理供应商程序的所有异常行为。
 
@@ -28,7 +28,7 @@ lazycat-status
 lazycat-list                 # 节点、SOCKS 上游地址和实际出口 IP
 lazycat-test                 # 再次实测已启用的每个密钥和出口
 lazycat-status               # 后台任务、OpenRC 状态与最近日志
-lazycat-sync                 # 节点增删或凭据变化时重新扫描与部署；已有节点的密码不变
+lazycat-sync                 # 节点增删或凭据变化时重新扫描与部署，结束时列出密码；已有节点的密码不变
 lazycat-export               # 显示加密方式、内部端口和每个节点的密码（含密钥，勿公开）
 lazycat-export --tsv         # 每行「节点名<TAB>密码」，便于批量导入面板
 lazycat-export --backup      # 额外显示恢复码，重装小鸡后用它找回全部旧密码
@@ -42,6 +42,8 @@ lazycat-links HK_IP HK_PORT  # 输出客户端 ss:// 链接，含密钥，勿公
 ```sh
 git -C /root/lazycat-multi pull --ff-only && sh /root/lazycat-multi/install.sh --no-scan
 ```
+
+`git pull` 只更新 `/root/lazycat-multi` 里的源码，`lazycat-sync` 等命令运行的是 `install.sh` 复制到 `/usr/local/libexec/lazycat-multi/` 的那份，所以拉取后一定要再跑一次 `install.sh`（加 `--no-scan` 即可）。
 
 LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端口 → 这台 LXC 的内部端口 12000`。公网端口可留空由平台分配，记下实际公网地址和端口。下面按香港机 3x-ui 的使用目标选择一种接法。
 

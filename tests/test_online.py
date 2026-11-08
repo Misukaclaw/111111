@@ -1,5 +1,7 @@
 """Checks for online discovery boundaries and deployment rollback."""
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -447,6 +449,108 @@ class ExportTests(unittest.TestCase):
 
     def test_backup_adds_recovery_code(self):
         self.assertIn(self.master, online.export_lines(self.base, backup=True))
+
+    def test_sync_result_marks_new_and_gone_nodes(self):
+        lines = online.export_lines(self.base, previous={"KDDI", "Bell", "Old"})
+        self.assertIn("节点: HKT  [STALE] 新增", lines)
+        self.assertIn("节点: KDDI  [OK]", lines)
+        self.assertIn("新增节点（需在面板添加出站）: HKT", lines)
+        # Bell is still in the menu (skipped), so only Old counts as gone.
+        self.assertIn("菜单里已没有、已停用: Old", lines)
+
+    def test_plain_export_marks_nothing_new(self):
+        self.assertFalse(any("新增" in line for line in online.export_lines(self.base)))
+
+    def test_sync_result_prints_passwords_and_failed_notice(self):
+        status = self.base / "status.json"
+        core.save_private_json(status, {"state": "failed", "message": "OpenRC 服务启动后退出"})
+        out = io.StringIO()
+        with patch.object(online, "CURRENT", _Link(self.base)), \
+             patch.object(online, "STATUS", status), \
+             patch.object(online, "_service_running", return_value=True), \
+             contextlib.redirect_stdout(out):
+            online._print_result({"KDDI", "HKT"})
+        text = out.getvalue()
+        self.assertIn("本次同步没有生效", text)
+        self.assertIn(f"密码: {self.password('KDDI')}", text)
+        self.assertNotIn("新增", text)
+        self.assertNotIn("[警告]", text)
+        self.assertNotIn(self.master, text)
+
+    def test_sync_result_warns_when_gateway_is_down(self):
+        status = self.base / "status.json"
+        core.save_private_json(status, {"state": "ok", "message": "done"})
+        out = io.StringIO()
+        with patch.object(online, "CURRENT", _Link(self.base)), \
+             patch.object(online, "STATUS", status), \
+             patch.object(online, "_service_running", return_value=False), \
+             contextlib.redirect_stdout(out):
+            online._print_result(None)
+        self.assertIn("OpenRC: stopped", out.getvalue())
+        self.assertIn("install.sh --no-scan", out.getvalue())
+
+    def test_status_points_to_export_without_showing_keys(self):
+        status = self.base / "status.json"
+        core.save_private_json(status, {"state": "partial", "message": "2/3"})
+        log = self.base / "install.log"
+        log.write_text("[完成] 2/3 个出口可用\n", encoding="utf-8")
+        out = io.StringIO()
+        with patch.object(online, "CURRENT", _Link(self.base)), \
+             patch.object(online, "STATUS", status), \
+             patch.object(online, "LOG", log), \
+             patch.object(online.subprocess, "run", return_value=Mock(returncode=0)), \
+             contextlib.redirect_stdout(out):
+            online._show_status()
+        text = out.getvalue()
+        self.assertIn("各节点密码: lazycat-export", text)
+        self.assertIn("程序版本:", text)
+        self.assertNotIn(self.state["server_key"], text)
+
+
+class _Link(type(Path())):
+    """A real directory that reports itself as the `current` symlink."""
+
+    def is_symlink(self):
+        return True
+
+
+class FollowTests(unittest.TestCase):
+    def test_follow_shows_only_new_log_until_worker_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "install.log"
+            log.write_bytes("旧日志\n".encode("utf-8"))
+            offset = log.stat().st_size
+            line = "[上游] 韩国: 192.0.2.7\n".encode("utf-8")
+            # The worker writes a line split inside a UTF-8 character, then exits.
+            pieces = [line[:3], line[3:], "[完成] 1/1\n".encode("utf-8")]
+
+            def poll():
+                with log.open("ab") as stream:
+                    stream.write(pieces.pop(0))
+                return 0 if not pieces else None
+
+            process = Mock()
+            process.poll.side_effect = poll
+            out = io.StringIO()
+            with patch.object(online, "LOG", log), patch.object(online.time, "sleep"), \
+                 contextlib.redirect_stdout(out):
+                self.assertTrue(online._follow(process, offset))
+        self.assertEqual(out.getvalue(), "[上游] 韩国: 192.0.2.7\n[完成] 1/1\n")
+
+    def test_ctrl_c_only_stops_the_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "install.log"
+            log.write_bytes(b"")
+            process = Mock()
+            process.poll.return_value = None
+            out = io.StringIO()
+            with patch.object(online, "LOG", log), \
+                 patch.object(online.time, "sleep", side_effect=KeyboardInterrupt), \
+                 contextlib.redirect_stdout(out):
+                self.assertFalse(online._follow(process, 0))
+        self.assertIn("仍在后台运行", out.getvalue())
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
 
 
 if __name__ == "__main__":

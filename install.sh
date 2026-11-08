@@ -42,6 +42,9 @@ install -d -m 0755 "$TARGET_DIR"
 for name in core.py trace_parser.py preflight.py online.py cli.py; do
     install -m 0644 "$SOURCE_DIR/$name" "$TARGET_DIR/$name"
 done
+# lazycat-status shows this, so an outdated install is visible at a glance.
+VERSION=$(git -C "$SOURCE_DIR" log -1 --format='%h %cs' 2>/dev/null || echo unknown)
+printf '%s\n' "$VERSION" > "$TARGET_DIR/VERSION"
 install -d -m 0700 /etc/lazycat-multi /var/log/lazycat-multi
 
 # Run the gateway from a renamed copy: LazyCat's own stop routine may kill

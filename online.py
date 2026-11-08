@@ -8,6 +8,7 @@ derived keys stay in root-only directories on the LXC.
 from __future__ import annotations
 
 import argparse
+import codecs
 import ipaddress
 import json
 import os
@@ -863,6 +864,62 @@ def _watchdog() -> int:
     return 0
 
 
+def _enabled_names() -> set[str] | None:
+    """Node names the installed config serves, to mark new ones after a sync."""
+    if not CURRENT.is_symlink():
+        return None
+    try:
+        return set(core.load_private_state(CURRENT / "state.json")["nodes"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _follow(process: subprocess.Popen[bytes], offset: int) -> bool:
+    """Show the worker's log until it exits; False if the user stopped watching.
+
+    The worker runs in its own session, so an SSH drop or Ctrl+C here only
+    ends this display, never the sync itself.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    try:
+        with LOG.open("rb") as log:
+            log.seek(offset)
+            while True:
+                done = process.poll() is not None
+                chunk = log.read()
+                if chunk:
+                    sys.stdout.write(decoder.decode(chunk))
+                    sys.stdout.flush()
+                if done:
+                    return True
+                if not chunk:
+                    time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n已停止显示进度；同步仍在后台运行。稍后运行 lazycat-status 查看，"
+              "完成后用 lazycat-export 查看密码。", flush=True)
+        return False
+
+
+def _print_result(before: set[str] | None) -> None:
+    """After a sync: outcome, gateway state and every enabled node's password."""
+    try:
+        value = json.loads(STATUS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        value = {}
+    state = value.get("state", "?")
+    print(f"\n结果 {state}: {value.get('message', '')}")
+    if not CURRENT.is_symlink():
+        return
+    running = _service_running()
+    print("OpenRC: running" if running else "OpenRC: stopped")
+    if state == "failed":
+        print("本次同步没有生效，网关仍用上一版配置；下面的密码与同步前相同。")
+    print("\n以下含密钥，只在本机复制，勿公开:\n")
+    print("\n".join(export_lines(CURRENT, previous=before)))
+    if not running:
+        print("[警告] 网关没有运行，执行: sh /root/lazycat-multi/install.sh --no-scan")
+
+
 def _launch(operation: str) -> int:
     if os.geteuid() != 0:
         raise OnlineError("请以 root 运行")
@@ -870,23 +927,36 @@ def _launch(operation: str) -> int:
     if GUARD.exists():
         raise OnlineError("已有扫描任务在运行；请先查看 lazycat-status")
     LOG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    before = _enabled_names()
     _status("queued", "扫描任务已排队启动")
     with LOG.open("ab") as log:
         os.chmod(LOG, 0o600)
+        offset = os.fstat(log.fileno()).st_size
         process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_worker", operation],
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
-    print(f"后台任务已启动 (PID {process.pid})。查看进度: lazycat-status")
-    print("扫描时 SSH 可能短暂断开；任务和路由恢复看门狗会继续运行。")
-    return 0
+    print(f"后台任务已启动 (PID {process.pid})，下面实时显示进度，结束后列出各节点密码。")
+    print("扫描时 SSH 可能短暂断开；任务和路由恢复看门狗会继续运行，"
+          "重连后用 lazycat-status 查看。\n", flush=True)
+    if not _follow(process, offset):
+        return 0
+    _print_result(before)
+    return process.returncode or 0
 
 
 def _show_status() -> int:
+    phase = None
     if STATUS.exists():
         value = json.loads(STATUS.read_text(encoding="utf-8"))
+        phase = value.get("state")
         print(f"{value.get('state', '?')}: {value.get('message', '')}")
     else:
         print("尚未运行安装或同步")
+    try:
+        version = Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        version = "未记录（旧版安装）"
+    print(f"程序版本: {version}")
     if CURRENT.is_symlink():
         result = subprocess.run(["rc-service", SERVICE, "status"], capture_output=True,
                                 text=True, check=False)
@@ -897,6 +967,9 @@ def _show_status() -> int:
         print("最近日志:")
         for line in LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-12:]:
             print(line)
+    if phase in ("ok", "partial", "failed") and CURRENT.is_symlink():
+        # Status output gets pasted for troubleshooting, so it carries no keys.
+        print("各节点密码: lazycat-export")
     return 0
 
 
@@ -941,8 +1014,13 @@ def _links(host: str, port: int) -> int:
     return 0
 
 
-def export_lines(base: Path, *, tsv: bool = False, backup: bool = False) -> list[str]:
-    """Client passwords of the enabled nodes, in LazyCat menu order."""
+def export_lines(base: Path, *, tsv: bool = False, backup: bool = False,
+                 previous: set[str] | None = None) -> list[str]:
+    """Client passwords of the enabled nodes, in LazyCat menu order.
+
+    `previous` is the node set served before a sync; nodes outside it are
+    marked new, and served nodes no longer in the menu are listed as gone.
+    """
     state = core.load_private_state(base / "state.json")
     meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
     status = {entry["name"]: entry.get("status", "-") for entry in meta["nodes"]}
@@ -954,13 +1032,20 @@ def export_lines(base: Path, *, tsv: bool = False, backup: bool = False) -> list
 
     if tsv:
         return [f"{name}\t{password(name)}" for name in names]
+    added = [name for name in names if previous is not None and name not in previous]
     lines = [f"加密: {core.METHOD}", f"内部端口: {PORT}",
              f"主密钥指纹: {state['master_id'][:12]}（同步前后应保持不变）", ""]
     for name in names:
-        lines += [f"节点: {name}  [{status.get(name, '-')}]", f"密码: {password(name)}", ""]
+        mark = " 新增" if name in added else ""
+        lines += [f"节点: {name}  [{status.get(name, '-')}]{mark}", f"密码: {password(name)}", ""]
     skipped = [entry["name"] for entry in meta["nodes"] if entry["name"] not in state["nodes"]]
     if skipped:
         lines += ["本次扫描失败、未启用: " + "、".join(skipped), ""]
+    if added:
+        lines += ["新增节点（需在面板添加出站）: " + "、".join(added), ""]
+    gone = sorted((previous or set()) - set(status) - set(state["nodes"]))
+    if gone:
+        lines += ["菜单里已没有、已停用: " + "、".join(gone), ""]
     if backup:
         master = json.loads((base / "master.json").read_text(encoding="utf-8"))["master"]
         lines += ["恢复码（小鸡重装后用它找回全部旧密码；离线保存，勿外传）:", master,
