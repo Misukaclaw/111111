@@ -322,7 +322,7 @@ class OnlineTests(unittest.TestCase):
              patch.object(online.subprocess, "run", return_value=Mock(returncode=0)), \
              patch.object(online.subprocess, "Popen", return_value=Mock()), \
              patch.object(online, "_wait_tcp"), \
-             patch.object(online, "_verify_routes"), \
+             patch.object(online, "_verify_routes", return_value=[]), \
              patch.object(online, "_terminate_process"):
             online.verify_candidate("sing-box", state, {"a": "192.0.2.10", "b": "192.0.2.11"},
                                     Path("/tmp"))
@@ -505,6 +505,156 @@ class ExportTests(unittest.TestCase):
         self.assertIn("各节点密码: lazycat-export", text)
         self.assertIn("程序版本:", text)
         self.assertNotIn(self.state["server_key"], text)
+
+
+MENU_V18 = """选择: 1
+
+------ 切换节点 ------
+正在获取节点列表...
+
+-------------- 日本 --------------
+  [1] 日本SoftBank-动态家宽
+  [2] 日本Biglobe动态家宽
+
+-------------- 美国 --------------
+  [3] 美国-Pavlov动态家宽
+
+------------- 菲律宾 -------------
+  [4] 菲律宾-DITO动态家宽
+
+请输入节点序号进行切换 (输入0取消): """
+
+
+class VendorV18Tests(unittest.TestCase):
+    def test_v18_menu_with_regions_and_serial_prompt_is_parsed(self):
+        self.assertEqual(online.parse_menu(MENU_V18),
+                         [(1, "日本SoftBank-动态家宽"), (2, "日本Biglobe动态家宽"),
+                          (3, "美国-Pavlov动态家宽"), (4, "菲律宾-DITO动态家宽")])
+
+    def test_exit_ip_accepts_ipv4_and_ipv6_and_rejects_pages(self):
+        self.assertEqual(online._exit_ip(b"192.0.2.7\n"), "192.0.2.7")
+        self.assertEqual(online._exit_ip(b"2001:db8::1\n"), "2001:db8::1")
+        with self.assertRaises(ValueError):
+            online._exit_ip(b"<html>please register</html>")
+
+    def test_ip_echo_prefers_ipv4_only_hosts(self):
+        self.assertEqual(online.IP_ECHO_HOSTS[:2], ("api4.ipify.org", "ipv4.icanhazip.com"))
+
+
+class PartialVerificationTests(unittest.TestCase):
+    """One flaky exit must not throw away a sync where the others work."""
+
+    def test_route_check_retries_and_reports_only_persistent_failures(self):
+        calls = []
+
+        def verify(binary, state, name, work, port):
+            calls.append(name)
+            if name == "b" or calls.count("a") == 1:
+                raise online.OnlineError("SSLEOFError")
+            return "192.0.2.1"
+
+        with patch.object(online, "_verify_one", side_effect=verify), \
+             patch.object(online, "_guard_update"), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            failed = online._verify_routes("sing-box", {}, {"a": "192.0.2.1", "b": "192.0.2.2"},
+                                           Path("/tmp"), 12000)
+        self.assertEqual(failed, ["b"])
+        self.assertEqual(calls, ["a", "a", "b", "b"])
+        self.assertIn("[未验证] b", out.getvalue())
+
+    def _candidate(self, failing):
+        master = core.generate_master()
+        state = core.reconcile_nodes([core.Node("a", "192.0.2.1", 5001, "u", "p"),
+                                      core.Node("b", "192.0.2.2", 5002, "u", "p")], master=master)
+        with patch.object(online, "_free_port", side_effect=[10001, 10002]), \
+             patch.object(online.core, "save_private_config"), \
+             patch.object(online.subprocess, "run", return_value=Mock(returncode=0)), \
+             patch.object(online.subprocess, "Popen", return_value=Mock()), \
+             patch.object(online, "_wait_tcp"), \
+             patch.object(online, "_verify_routes",
+                          side_effect=lambda b, s, exp, w, p: [n for n in exp if n in failing]), \
+             patch.object(online, "_terminate_process"):
+            return online.verify_candidate("sing-box", state, {"a": "x", "b": "y"}, Path("/tmp"))
+
+    def test_candidate_returns_the_users_that_did_not_verify(self):
+        self.assertEqual(self._candidate({"b"}), ["b"])
+
+    def test_candidate_fails_when_no_user_verifies(self):
+        with self.assertRaisesRegex(online.OnlineError, "没有任何出口"):
+            self._candidate({"a", "b"})
+
+    def _deploy(self, failing):
+        current = Mock()
+        current.is_symlink.return_value = True
+        current.resolve.return_value = Path("/etc/lazycat-multi/generations/previous")
+        with patch.object(online, "CURRENT", current), \
+             patch.object(online, "_switch") as switch, \
+             patch.object(online, "_start_service"), \
+             patch.object(online, "_wait_service_port"), \
+             patch.object(online, "_verify_routes", return_value=sorted(failing)), \
+             patch.object(online.subprocess, "run", return_value=Mock(returncode=0)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            try:
+                return online._deploy(Path("/etc/lazycat-multi/generations/new"), "sing-box",
+                                      {}, {"a": "x", "b": "y"}, Path("/tmp")), switch
+            except online.OnlineError as exc:
+                return exc, switch
+
+    def test_deploy_keeps_new_config_when_some_users_fail(self):
+        result, switch = self._deploy({"b"})
+        self.assertEqual(result, ["b"])
+        self.assertEqual(switch.call_count, 1)
+
+    def test_deploy_rolls_back_when_no_user_reaches_an_exit(self):
+        result, switch = self._deploy({"a", "b"})
+        self.assertIsInstance(result, online.OnlineError)
+        self.assertEqual(switch.call_args_list[-1].args[0],
+                         Path("/etc/lazycat-multi/generations/previous"))
+
+
+class ReinstallKeyTests(unittest.TestCase):
+    """Typing the same code or passphrase on a reinstalled box restores passwords."""
+
+    def test_recovery_code_is_used_as_is(self):
+        master = core.generate_master()
+        self.assertEqual(core.master_from_secret(f"  {master}\n"), master)
+
+    def test_same_passphrase_gives_same_passwords(self):
+        first = core.master_from_secret("my cat likes tea")
+        self.assertEqual(core.master_from_secret("my cat likes tea"), first)
+        self.assertNotEqual(core.master_from_secret("my cat likes TEA"), first)
+        core.derive_server_key(first)  # a valid master seed
+
+    def test_short_passphrase_is_rejected(self):
+        with self.assertRaises(ValueError):
+            core.master_from_secret("short")
+
+    def test_install_helper_prints_master_and_fingerprint(self):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(online.sys, "stdin", io.StringIO("my cat likes tea\n")), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(online.main(["_master"]), 0)
+        master = out.getvalue().strip()
+        self.assertEqual(master, core.master_from_secret("my cat likes tea"))
+        state = core.reconcile_nodes([], master=master)
+        self.assertIn(state["master_id"][:12], err.getvalue())
+
+    def test_install_helper_rejects_short_text(self):
+        with patch.object(online.sys, "stdin", io.StringIO("short\n")), \
+             contextlib.redirect_stdout(io.StringIO()) as out, \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(online.main(["_master"]), 1)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_saved_master_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(online, "MASTER_FILE", root / "master.json"), \
+                 patch.object(online, "GENERATIONS", root / "generations"):
+                self.assertFalse(online._has_saved_master())
+                (root / "generations" / "generation-x").mkdir(parents=True)
+                (root / "generations" / "generation-x" / "master.json").write_text("{}")
+                self.assertTrue(online._has_saved_master())
 
 
 class _Link(type(Path())):

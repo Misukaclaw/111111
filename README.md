@@ -18,7 +18,7 @@ apk add --no-cache git && (git -C /root/lazycat-multi pull --ff-only || git clon
 lazycat-status
 ```
 
-看到 `ok` 或 `partial: LXC 本机服务已启动`，并且 `OpenRC: running`，才表示 LXC 本机已有可用出口。`partial` 表示有节点被跳过，用 `lazycat-list` 查看具体名称；完成后用 `lazycat-export` 查看密码。看到 `failed` 时，把 `lazycat-status` 的完整输出发来排查（它不含密钥，第二行「程序版本」可看出小鸡上的程序是否已更新）；**不要发送** `/etc/lazycat-multi/` 下的 JSON、原始 trace 或带密钥的链接。
+看到 `ok` 或 `partial: LXC 本机服务已启动`，并且 `OpenRC: running`，才表示 LXC 本机已有可用出口。`partial` 表示有节点被跳过（`SKIPPED`）、暂用旧上游（`STALE`），或启用了但这次没通过网关验证（`UNVERIFIED`，多半是动态出口临时抽风，可用 `lazycat-test` 复查），用 `lazycat-list` 查看具体名称；完成后用 `lazycat-export` 查看密码。看到 `failed` 时，把 `lazycat-status` 的完整输出发来排查（它不含密钥，第二行「程序版本」可看出小鸡上的程序是否已更新）；**不要发送** `/etc/lazycat-multi/` 下的 JSON、原始 trace 或带密钥的链接。
 
 安装器要求：Alpine Linux、root、现存 `/usr/local/bin/proxy`、一条未指向 `cat0` 的 IPv4 默认路由、可用的 `apk` 源。若不满足条件，会停止而不开始节点扫描。首次通过 SSH 自动抓取节点仍有失联风险；看门狗只能按扫描前快照尝试恢复，不能保证处理供应商程序的所有异常行为。
 
@@ -35,7 +35,15 @@ lazycat-export --backup      # 额外显示恢复码，重装小鸡后用它找�
 lazycat-links HK_IP HK_PORT  # 输出客户端 ss:// 链接，含密钥，勿公开
 ```
 
-**密码会不会变：** 每个节点的密码由主密钥和节点名算出。主密钥首次安装时生成，单独保存在 `/etc/lazycat-multi/master.json`，之后每次 `lazycat-sync` 都沿用，所以已有节点的密码不变，只有新出现的节点会多出新密码。`lazycat-status` 和 `lazycat-export` 都会显示「主密钥指纹」，同步前后应完全一致。只有重装小鸡系统会丢失主密钥：重装前运行 `lazycat-export --backup` 记下恢复码，重装后用 `LC_MASTER='恢复码' sh /root/lazycat-multi/install.sh` 安装，全部密码与重装前相同。
+**密码会不会变：** 每个节点的密码由主密钥和节点名算出。主密钥保存在 `/etc/lazycat-multi/master.json`，之后每次 `lazycat-sync` 都沿用，所以已有节点的密码不变，只有新出现的节点会多出新密码。`lazycat-status` 和 `lazycat-export` 都会显示「主密钥指纹」，同步前后应完全一致。
+
+**重装小鸡后密码保持不变：** 重装会清掉主密钥。安装时若发现小鸡上没有主密钥，安装程序会询问（输入时屏幕不显示）：
+
+- 输入**固定口令**（至少 8 个字符，自己记好）：同一个口令永远算出同一个主密钥，以后每次重装都输入它，全部密码不变。推荐用这种方式。
+- 或粘贴**恢复码**：重装前用 `lazycat-export --backup` 看到的那一长串，粘贴后密码和重装前一样。
+- 直接回车：随机生成，全部密码都会变。
+
+输入后会显示主密钥指纹，与重装前 `lazycat-status` 显示的一致，就说明密码没变。不想交互时也可以 `LC_SECRET='口令或恢复码' sh /root/lazycat-multi/install.sh`。已经装好的小鸡不会被询问；想从现在起改用固定口令，需要重装一次（所有密码会最后变一次）。
 
 **只更新程序、不重新扫描：**
 
@@ -68,7 +76,8 @@ LXC 本机启动后，在 LazyCat NAT 面板选择 **TCP**，添加 `公网端�
 
 - 扫描一次只接受完整、无重复的菜单；每个节点 trace 必须含唯一、完整写入的 SOCKS 配置。单个节点抓取或出口验证失败会跳过该节点；同名旧节点若仍可连接，会暂用旧上游并标为 `STALE`。菜单中没有任何可用出口、菜单中途变化或网络路由恢复失败时，整次同步不切换正式配置。
 - 网关用重命名的 sing-box 副本 `/usr/local/libexec/lazycat-multi/gateway` 运行，避免 LazyCat 停止菜单按进程名 `sing-box` 清理时误杀；OpenRC 对它无限次自动重启。同步结束时不论成败都会检查网关，若扫描期间被停掉会自动重新启动；新配置启动失败则退回上一版并重新启动网关，不会让全部节点停在 -1。`lazycat-status` 若显示 `OpenRC: stopped`，运行 `sh /root/lazycat-multi/install.sh --no-scan` 即可拉起。
-- 每个上游先通过 SOCKS5 验证 HTTPS 出口 IP；候选 sing-box 在回环地址运行，再用各 SS 用户密钥逐一验证路由。正式 OpenRC 服务启动后会重复用户到出口验证，失败则回滚。
+- 每个上游先通过 SOCKS5 验证 HTTPS 出口 IP（优先用只走 IPv4 的检测站，也接受 IPv6 回答）；候选 sing-box 在回环地址运行，再用各 SS 用户密钥逐一验证路由，每个用户失败会重试一次。正式 OpenRC 服务启动后会重复用户到出口验证。个别用户验证不过只标为 `UNVERIFIED`、照常启用；所有用户都验证不过才判定配置有问题并回滚。
+- 兼容 LazyCat-Global v1.8.0 菜单（按地区分组、提示「请输入节点序号」，节点列表要联网获取，最多等 60 秒）。
 - `proxy` 的节点选择会启动供应商 TUN。扫描任务脱离 SSH 会话运行；每次选择后调用供应商菜单停止 TUN，核对并尝试恢复默认路由与策略规则。看门狗负责处理任务意外退出或长时间无进展。
 - 主密钥保存在 `/etc/lazycat-multi/master.json`，SOCKS 凭据、配置及出口清单保存在 `/etc/lazycat-multi/generations/`，目录权限 `0700`、文件 `0600`。GitHub 仓库只含程序和虚构测试样本。`current` 链接意外丢失时，程序从 `master.json` 或最新一版配置中找回主密钥，不会另生成新密钥；若 `LC_MASTER` 与已有主密钥不一致会报错，不会静默更换全部密码。
 - 本机测试只验证 TCP/HTTPS 的出口映射和 OpenRC 监听。UDP 数据、LazyCat NAT、HK 转发及手机客户端导入须在相应环境测试；`sing-box check` 也不能证明这些外部链路可用。

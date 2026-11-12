@@ -57,6 +57,32 @@ def _master_bytes(master: str) -> bytes:
     return raw
 
 
+PASSPHRASE_SALT = b"lazycat-multi/master-passphrase/v1"
+MIN_PASSPHRASE = 8
+
+
+def master_from_secret(secret: str) -> str:
+    """Turn what the user typed at install time into the master seed.
+
+    A recovery code (canonical base64 of >= 32 bytes, as `lazycat-export
+    --backup` prints it) is used as is. Anything else is a passphrase: the same
+    passphrase always yields the same master, so a reinstalled box gets the
+    same client passwords back. scrypt makes guessing a passphrase costly.
+    """
+    secret = secret.strip()
+    try:
+        _master_bytes(secret)
+    except ValueError:
+        pass
+    else:
+        return secret
+    if len(secret) < MIN_PASSPHRASE:
+        raise ValueError(f"passphrase must be at least {MIN_PASSPHRASE} characters")
+    raw = hashlib.scrypt(secret.encode("utf-8"), salt=PASSPHRASE_SALT,
+                         n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+    return base64.b64encode(raw).decode("ascii")
+
+
 def _derived_key(master: bytes, purpose: bytes) -> str:
     raw = hmac.digest(master, b"lazycat-multi/ss2022/v1/" + purpose, "sha256")[:KEY_BYTES]
     return base64.b64encode(raw).decode("ascii")

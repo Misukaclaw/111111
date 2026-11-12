@@ -100,5 +100,28 @@ if [ "$NO_SCAN" -eq 1 ]; then
     echo '[完成] 程序和命令已更新；未扫描节点，密码不变。'
     exit 0
 fi
+# A fresh or reinstalled box has no saved master key. Ask for the old recovery
+# code or a fixed passphrase, so every client password comes back unchanged.
+if [ -z "${LC_MASTER:-}" ] && ! python3 "$TARGET_DIR/online.py" _has-master; then
+    SECRET="${LC_SECRET:-}"
+    if [ -z "$SECRET" ] && [ -t 0 ]; then
+        echo ''
+        echo '[密码] 这台小鸡上没有保存的主密钥（首次安装或刚重装过）。'
+        echo '  - 想和重装前的密码一样：粘贴以前保存的恢复码，或输入以前设过的固定口令；'
+        echo '  - 想以后重装都不用再改密码：现在设一个固定口令（至少 8 个字符，自己记好），'
+        echo '    以后每次重装输入同一个口令，全部密码都不变；'
+        echo '  - 直接回车：随机生成，全部节点密码会和以前不同。'
+        printf '请输入（输入时屏幕不显示）: '
+        stty -echo 2>/dev/null || true
+        read -r SECRET || SECRET=''
+        stty echo 2>/dev/null || true
+        echo ''
+    fi
+    if [ -n "$SECRET" ]; then
+        LC_MASTER=$(printf '%s\n' "$SECRET" | python3 "$TARGET_DIR/online.py" _master) || exit 1
+        export LC_MASTER
+    fi
+    unset SECRET
+fi
 echo '[开始] 后台扫描与部署；SSH 暂断时任务仍会继续。'
 exec python3 "$TARGET_DIR/online.py" install

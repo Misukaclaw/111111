@@ -8,7 +8,9 @@ derived keys stay in root-only directories on the LXC.
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
+import hashlib
 import ipaddress
 import json
 import os
@@ -62,7 +64,12 @@ WATCHDOG_SECONDS = 90
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MENU_ENTRY = re.compile(r"^\s*\[(\d+)\]\s*(.*?)\s*$")
 INITIAL_PROMPT = re.compile(r"选择[^\r\n]{0,60}[:：]")
-NODE_PROMPT = re.compile(r"请输入节点\s*ID[^\r\n]{0,60}[:：]", re.I)
+# Older menus ask for a node "ID"; v1.8.0 asks for a node "序号".
+NODE_PROMPT = re.compile(r"请输入节点\s*(?:ID|序号|编号)[^\r\n]{0,60}[:：]", re.I)
+# v1.8.0 fetches the node list online before showing it.
+NODE_MENU_SECONDS = 60
+# A dynamic residential exit can drop a single request; retry before giving up.
+VERIFY_ATTEMPTS = 2
 
 
 class OnlineError(Exception):
@@ -173,7 +180,7 @@ def _terminate_menu(pid: int, fd: int) -> None:
 def _menu_to_node_prompt(fd: int) -> str:
     _read_until(fd, INITIAL_PROMPT, 20)
     os.write(fd, b"1\n")
-    return _read_until(fd, NODE_PROMPT, 30)
+    return _read_until(fd, NODE_PROMPT, NODE_MENU_SECONDS)
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -317,12 +324,21 @@ def _recv_exact(sock: socket.socket, count: int) -> bytes:
     return bytes(data)
 
 
+def _exit_ip(body: bytes) -> str:
+    """The address an IP-echo service returned (IPv4, or IPv6 on a v6 path)."""
+    return str(ipaddress.ip_address(body.decode("ascii").strip()))
+
+
+# IPv4-only names first: a dual-stack exit otherwise answers with IPv6.
+IP_ECHO_HOSTS = ("api4.ipify.org", "ipv4.icanhazip.com", "api.ipify.org")
+
+
 def probe_socks(host: str, port: int, username: str | None, password: str | None) -> str:
     """SOCKS5 CONNECT + HTTPS IP check; credentials never appear in argv/logs."""
     if (username is None) != (password is None):
         raise OnlineError("SOCKS 用户名与密码必须同时提供")
     failures: list[str] = []
-    for destination in ("api.ipify.org", "icanhazip.com"):
+    for destination in IP_ECHO_HOSTS:
         try:
             with socket.create_connection((host, port), timeout=8) as sock:
                 sock.settimeout(12)
@@ -365,7 +381,7 @@ def probe_socks(host: str, port: int, username: str | None, password: str | None
                     if not marker:
                         raise OnlineError("出口检测网站的分块响应不完整")
                     body = payload[:int(length.split(b";", 1)[0], 16)]
-                return str(ipaddress.IPv4Address(body.decode("ascii").strip()))
+                return _exit_ip(body)
         except OnlineError as exc:
             failures.append(f"{destination}: {exc}")
             continue
@@ -403,37 +419,66 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=4)
 
 
+def _verify_one(binary: str, state: dict[str, Any], name: str, work: Path,
+                server_port: int) -> str:
+    """Exit IP one Shadowsocks user reaches through the gateway on server_port."""
+    client_port = _free_port()
+    client_config = {
+        "inbounds": [{"type": "socks", "tag": "test-in", "listen": "127.0.0.1",
+                      "listen_port": client_port}],
+        "outbounds": [core.client_config(state, name, "127.0.0.1", server_port)],
+    }
+    client_path = work / "test-client.json"
+    core.save_private_config(client_path, client_config)
+    client = subprocess.Popen([binary, "run", "-c", str(client_path)],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    try:
+        _wait_tcp(client_port, client)
+        return probe_socks("127.0.0.1", client_port, None, None)
+    finally:
+        _terminate_process(client)
+
+
 def _verify_routes(binary: str, state: dict[str, Any], expected_ips: dict[str, str],
-                   work: Path, server_port: int) -> None:
+                   work: Path, server_port: int) -> list[str]:
+    """Check each user's route; return the users that still fail after a retry.
+
+    One flaky residential exit must not sink the whole sync, so a failure is
+    reported per user and the caller decides what to do with it.
+    """
+    failed: list[str] = []
     for name in sorted(expected_ips):
-        client_port = _free_port()
-        client_config = {
-            "inbounds": [{"type": "socks", "tag": "test-in", "listen": "127.0.0.1",
-                          "listen_port": client_port}],
-            "outbounds": [core.client_config(state, name, "127.0.0.1", server_port)],
-        }
-        client_path = work / "test-client.json"
-        core.save_private_config(client_path, client_config)
-        client = subprocess.Popen([binary, "run", "-c", str(client_path)],
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-        try:
-            _wait_tcp(client_port, client)
-            actual = probe_socks("127.0.0.1", client_port, None, None)
+        error: OnlineError | None = None
+        for _ in range(VERIFY_ATTEMPTS):
+            try:
+                actual = _verify_one(binary, state, name, work, server_port)
+            except OnlineError as exc:
+                error = exc
+                continue
+            error = None
             print(f"[验证] {name}: {actual}", flush=True)
             if actual != expected_ips[name]:
                 print(f"[提示] {name} 的公网 IP 在两次连接之间变化；"
                       "动态出口可出现这种情况", flush=True)
-            _guard_update()
-        finally:
-            _terminate_process(client)
+            break
+        if error is not None:
+            print(f"[未验证] {name}: {error}", flush=True)
+            failed.append(name)
+        _guard_update()
+    return failed
 
 
 def verify_candidate(binary: str, state: dict[str, Any], expected_ips: dict[str, str],
-                     work: Path) -> None:
+                     work: Path) -> list[str]:
+    """Prove per-user routing on a loopback copy; return users that did not verify.
+
+    Fails only when no user verifies, which points at the config, not an exit.
+    """
     # For each user, make every *other* upstream unreachable. A successful
     # request then proves auth_user selected that user's own SOCKS outbound,
     # even if a dynamic exit's public IPv4 changes between connections.
+    failed: list[str] = []
     for name in sorted(expected_ips):
         server_port = _free_port()
         candidate = core.build_config(state, listen="127.0.0.1", listen_port=server_port)
@@ -458,9 +503,12 @@ def verify_candidate(binary: str, state: dict[str, Any], expected_ips: dict[str,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_tcp(server_port, server)
-            _verify_routes(binary, state, {name: expected_ips[name]}, work, server_port)
+            failed += _verify_routes(binary, state, {name: expected_ips[name]}, work, server_port)
         finally:
             _terminate_process(server)
+    if expected_ips and len(failed) == len(expected_ips):
+        raise OnlineError("没有任何出口通过网关验证；保留已有配置")
+    return failed
 
 
 def _recover_master() -> str | None:
@@ -507,6 +555,15 @@ def _persist_master(master: str) -> None:
     core.save_private_json(MASTER_FILE, {"master": master})
 
 
+def _write_meta(generation: Path, menu: list[tuple[int, str]], ips: dict[str, str],
+                node_status: dict[str, str]) -> None:
+    core.save_private_json(generation / "meta.json", {
+        "nodes": [{"id": number, "name": name, "exit_ip": ips.get(name, ""),
+                   "status": node_status[name]}
+                  for number, name in menu],
+    })
+
+
 def _stage(state: dict[str, Any], master: str, binary: str,
            menu: list[tuple[int, str]], ips: dict[str, str],
            node_status: dict[str, str]) -> Path:
@@ -517,11 +574,7 @@ def _stage(state: dict[str, Any], master: str, binary: str,
         core.save_private_state(generation / "state.json", state)
         core.save_private_config(generation / "config.json",
                                  core.build_config(state, listen="0.0.0.0", listen_port=PORT))
-        core.save_private_json(generation / "meta.json", {
-            "nodes": [{"id": number, "name": name, "exit_ip": ips.get(name, ""),
-                       "status": node_status[name]}
-                      for number, name in menu],
-        })
+        _write_meta(generation, menu, ips, node_status)
         check = subprocess.run([binary, "check", "-c", str(generation / "config.json")],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=15, check=False)
@@ -616,18 +669,22 @@ def _ensure_running() -> None:
 
 
 def _deploy(generation: Path, binary: str, state: dict[str, Any],
-            expected_ips: dict[str, str], work: Path) -> None:
+            expected_ips: dict[str, str], work: Path) -> list[str]:
+    """Switch to the new config; return users the live gateway did not verify."""
     previous = CURRENT.resolve(strict=True) if CURRENT.is_symlink() else None
     try:
         _switch(generation)
         _start_service()
         _wait_service_port()
-        _verify_routes(binary, state, expected_ips, work, PORT)
+        failed = _verify_routes(binary, state, expected_ips, work, PORT)
+        if expected_ips and len(failed) == len(expected_ips):
+            raise OnlineError("网关已启动，但没有任何用户能经它到达出口")
         add = subprocess.run(["rc-update", "add", SERVICE, "default"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              timeout=10, check=False)
         if add.returncode:
             raise OnlineError("OpenRC 开机自启设置失败")
+        return failed
     except Exception:
         if previous is not None:
             # Bring the last good config back up even if the gateway was
@@ -775,18 +832,30 @@ def _worker(operation: str) -> int:
                     menu, previous, work, baseline, baseline_rules)
                 state = core.reconcile_nodes(records, previous, master=master)
                 _status("running", "逐一验证 Shadowsocks 用户到出口的映射")
-                verify_candidate(binary, state, ips, work)
+                # Users that fail here stay in the config: their upstream already
+                # answered during the scan, and the next sync checks them again.
+                for name in verify_candidate(binary, state, ips, work):
+                    node_status[name] = "UNVERIFIED"
                 generation = _stage(state, master, binary, menu, ips, node_status)
                 _status("running", "正在启动 OpenRC 服务")
-                _deploy(generation, binary, state, ips, work)
+                live_failed = _deploy(generation, binary, state, ips, work)
+                if live_failed:
+                    for name in live_failed:
+                        node_status[name] = "UNVERIFIED"
+                    _write_meta(generation, menu, ips, node_status)
                 print(f"[完成] {len(records)}/{len(menu)} 个出口可用，"
                       f"LXC TCP/UDP 端口 {PORT}", flush=True)
                 if skipped:
                     print("[跳过节点] " + "、".join(skipped), flush=True)
                 stale = [name for name, status in node_status.items() if status == "STALE"]
-                state_label = "partial" if skipped or stale else "ok"
+                unverified = [name for name, status in node_status.items() if status == "UNVERIFIED"]
+                if unverified:
+                    print("[未验证节点] " + "、".join(unverified)
+                          + "（已启用，可能是出口临时抽风；可用 lazycat-test 复查）", flush=True)
+                state_label = "partial" if skipped or stale or unverified else "ok"
                 _status(state_label, f"LXC 本机服务已启动（{len(records)}/{len(menu)} 个出口可用）",
-                        nodes=len(records), total=len(menu), skipped=skipped, stale=stale, port=PORT)
+                        nodes=len(records), total=len(menu), skipped=skipped, stale=stale,
+                        unverified=unverified, port=PORT)
                 return 0
         except (OnlineError, preflight.PreflightError, OSError, ValueError,
                 subprocess.TimeoutExpired) as exc:
@@ -918,6 +987,8 @@ def _print_result(before: set[str] | None) -> None:
     print("\n".join(export_lines(CURRENT, previous=before)))
     if not running:
         print("[警告] 网关没有运行，执行: sh /root/lazycat-multi/install.sh --no-scan")
+    print("提示: 小鸡重装后想让密码不变，重装时安装程序会询问，输入你设的固定口令，"
+          "或粘贴 lazycat-export --backup 显示的恢复码即可。")
 
 
 def _launch(operation: str) -> int:
@@ -999,7 +1070,10 @@ def _test() -> int:
                                      node["username"], node["password"])
     RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="test-", dir=RUNTIME) as directory:
-        _verify_routes(binary, state, expected, Path(directory), PORT)
+        failed = _verify_routes(binary, state, expected, Path(directory), PORT)
+    if failed:
+        print(f"FAIL: {len(failed)}/{len(expected)} 个用户没能经网关到达出口: " + "、".join(failed))
+        return 1
     print(f"PASS: {len(expected)} 个用户均到达预期出口")
     return 0
 
@@ -1053,6 +1127,26 @@ def export_lines(base: Path, *, tsv: bool = False, backup: bool = False,
     return lines
 
 
+def _master_from_stdin() -> int:
+    """install.sh helper: recovery code or passphrase on stdin -> master seed."""
+    try:
+        master = core.master_from_secret(sys.stdin.readline())
+    except ValueError:
+        print(f"错误: 不是有效的恢复码；当作固定口令也太短（至少 {core.MIN_PASSPHRASE} 个字符）",
+              file=sys.stderr)
+        return 1
+    fingerprint = hashlib.sha256(base64.b64decode(master)).hexdigest()[:12]
+    print(f"[密码] 主密钥指纹: {fingerprint}（与重装前 lazycat-status 显示的相同，密码就和以前一样）",
+          file=sys.stderr)
+    print(master)
+    return 0
+
+
+def _has_saved_master() -> bool:
+    """True when a sync can recover the master without the user's help."""
+    return MASTER_FILE.is_file() or any(GENERATIONS.glob("generation-*/master.json"))
+
+
 def _export(tsv: bool, backup: bool) -> int:
     if not CURRENT.is_symlink():
         raise OnlineError("尚未安装")
@@ -1063,7 +1157,8 @@ def _export(tsv: bool, backup: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["install", "sync", "status", "list", "links", "test",
-                                            "export", "_worker", "_watchdog"])
+                                            "export", "_worker", "_watchdog", "_master",
+                                            "_has-master"])
     parser.add_argument("extra", nargs="*")
     parser.add_argument("--tsv", action="store_true", help="export: '节点名<TAB>密码' 每行一个")
     parser.add_argument("--backup", action="store_true", help="export: 同时输出恢复码")
@@ -1075,6 +1170,10 @@ def main(argv: list[str] | None = None) -> int:
             return _worker(args.extra[0] if args.extra else "install")
         if args.command == "_watchdog":
             return _watchdog()
+        if args.command == "_master":
+            return _master_from_stdin()
+        if args.command == "_has-master":
+            return 0 if _has_saved_master() else 1
         if args.command == "status":
             return _show_status()
         if args.command == "list":
